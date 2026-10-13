@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minicode"
+version = "0.1.0"
+description = "MiniCode - minimal agent scaffold."
+requires-python = ">=3.10"
+dependencies = ["litellm", "pydantic", "pydantic-settings", "pyyaml", "rich"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

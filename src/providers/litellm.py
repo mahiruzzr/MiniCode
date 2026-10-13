@@ -1,0 +1,211 @@
+"""LiteLLM-backed LLM provider for MiniCode."""
+
+import json
+import os
+from typing import Any
+
+import litellm
+from litellm import acompletion
+
+from .base import LLMProvider, LLMResponse, ToolCallRequest
+from .registry import find_by_model, find_gateway
+
+
+class LiteLLMProvider(LLMProvider):
+    """Execute LLM requests through LiteLLM.
+
+    Translates between MiniCode's provider interface and LiteLLM:
+    provider routing comes from the registry metadata, requests go
+    out via LiteLLM, and responses are normalized back to
+    MiniCode's LLMResponse.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        default_model: str = "gpt-4o",
+        extra_headers: dict[str, str] | None = None,
+        provider_name: str | None = None,
+    ) -> None:
+        """Initialize the LiteLLM provider.
+
+        Args:
+            api_key: Provider API key, if any.
+            api_base: Custom API base URL, if any.
+            default_model: Model used when chat() gets none.
+            extra_headers: Extra headers forwarded to LiteLLM.
+            provider_name: Explicit provider name for gateway
+                detection.
+        """
+        super().__init__(api_key, api_base)
+        self.default_model = default_model
+        self.extra_headers = extra_headers or {}
+        self._gateway = find_gateway(provider_name, api_key, api_base)
+        if api_key:
+            self._setup_env(api_key, api_base, default_model)
+        if api_base:
+            litellm.api_base = api_base
+        litellm.suppress_debug_info = True
+        litellm.drop_params = True
+
+    def _setup_env(
+        self,
+        api_key: str,
+        api_base: str | None,
+        model: str,
+    ) -> None:
+        """Expose credentials through environment variables.
+
+        Args:
+            api_key: Provider API key.
+            api_base: Custom API base URL, if any.
+            model: Default model used to detect the provider.
+        """
+        spec = self._gateway or find_by_model(model)
+        if not spec:
+            return
+        if self._gateway:
+            os.environ[spec.env_key] = api_key
+        else:
+            os.environ.setdefault(spec.env_key, api_key)
+        effective_base = api_base or spec.default_api_base
+        for env_name, template in spec.env_extras:
+            resolved = template.replace("{api_key}", api_key)
+            resolved = resolved.replace("{api_base}", effective_base)
+            os.environ.setdefault(env_name, resolved)
+
+    def _resolve_model(self, model: str) -> str:
+        """Resolve a MiniCode model name to a LiteLLM model name.
+
+        Args:
+            model: Model name configured in MiniCode.
+
+        Returns:
+            Model name to send to LiteLLM.
+        """
+        if self._gateway:
+            prefix = self._gateway.litellm_prefix
+            if self._gateway.strip_model_prefix:
+                model = model.split("/")[-1]
+            if prefix and not model.startswith(f"{prefix}/"):
+                model = f"{prefix}/{model}"
+            return model
+        spec = find_by_model(model)
+        if spec and spec.litellm_prefix:
+            skipped = any(
+                model.startswith(skip) for skip in spec.skip_prefixes
+            )
+            if not skipped:
+                model = f"{spec.litellm_prefix}/{model}"
+        return model
+
+    def _apply_model_overrides(
+        self, model: str, kwargs: dict[str, Any]
+    ) -> None:
+        """Apply registry model overrides to request kwargs.
+
+        Args:
+            model: Resolved LiteLLM model name.
+            kwargs: Request kwargs updated in place.
+        """
+        spec = find_by_model(model)
+        if spec is None:
+            return
+        lowered = model.lower()
+        for pattern, overrides in spec.model_overrides:
+            if pattern in lowered:
+                kwargs.update(overrides)
+                return
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> LLMResponse:
+        """Send a chat completion request via LiteLLM.
+
+        Args:
+            messages: Message dicts with role and content.
+            tools: Optional tool definitions in OpenAI format.
+            model: Model identifier, defaults to default_model.
+            max_tokens: Maximum tokens in the response.
+            temperature: Sampling temperature.
+
+        Returns:
+            Normalized LLMResponse for the agent layer.
+        """
+        resolved = self._resolve_model(model or self.default_model)
+        kwargs: dict[str, Any] = {
+            "model": resolved,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        self._apply_model_overrides(resolved, kwargs)
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        if self.extra_headers:
+            kwargs["extra_headers"] = self.extra_headers
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        try:
+            response = await acompletion(**kwargs)
+            return self._parse_response(response)
+        except Exception as error:
+            return LLMResponse(
+                content=f"Error calling LLM: {str(error)}",
+                finish_reason="error",
+            )
+
+    def _parse_response(self, response: Any) -> LLMResponse:
+        """Parse a LiteLLM response into a MiniCode response.
+
+        Args:
+            response: Raw response object returned by LiteLLM.
+
+        Returns:
+            Normalized LLMResponse for the agent layer.
+        """
+        choice = response.choices[0]
+        message = choice.message
+        tool_calls: list[ToolCallRequest] = []
+        if hasattr(message, "tool_calls") and message.tool_calls:
+            for call in message.tool_calls:
+                arguments = call.function.arguments
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError:
+                        arguments = {"raw": arguments}
+                tool_calls.append(
+                    ToolCallRequest(
+                        id=call.id,
+                        name=call.function.name,
+                        arguments=arguments,
+                    )
+                )
+        usage: dict[str, int] = {}
+        if hasattr(response, "usage") and response.usage:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+        return LLMResponse(
+            content=message.content,
+            tool_calls=tool_calls,
+            finish_reason=choice.finish_reason or "stop",
+            usage=usage,
+            reasoning_content=getattr(
+                message, "reasoning_content", None
+            ),
+        )
+
+    def get_default_model(self) -> str:
+        """Get the provider's default model."""
+        return self.default_model

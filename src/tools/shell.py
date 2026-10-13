@@ -1,0 +1,116 @@
+"""Shell command execution tool for MiniCode."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import tempfile
+from typing import Any
+
+from .base import Tool
+
+_MAX_OUTPUT_CHARS = 30_000
+_DEFAULT_TIMEOUT = 120
+
+# Declarative preflight: (needle in command, required non-interactive flag,
+# hint). Interactive scaffolds hang forever waiting on stdin; refuse fast with
+# a fix instead of timing out. Add a case = add a row (no scattered ifs).
+_INTERACTIVE_SCAFFOLDS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("create-next-app", ("--yes", "-y"), "pass --yes"),
+    ("npm init", ("--yes", "-y"), "use `npm init -y`"),
+    ("npm create", ("--yes", "-y"), "pass --yes"),
+    ("yarn create", ("--yes", "-y"), "pass --yes"),
+    ("create-react-app", ("--template",), "specify --template to avoid prompts"),
+    ("vue create", ("--default", "-d"), "use `vue create -d`"),
+)
+
+
+def _preflight(command: str) -> str | None:
+    lowered = command.lower()
+    for needle, flags, hint in _INTERACTIVE_SCAFFOLDS:
+        if needle in lowered and not any(f in lowered for f in flags):
+            return (
+                f"Refusing to run an interactive scaffold ('{needle}') that would "
+                f"hang waiting for input. Re-run non-interactively: {hint}."
+            )
+    return None
+
+
+class BashTool(Tool):
+    """Run a bash command in the workspace and return its output."""
+
+    def __init__(self, workspace: str):
+        self._workspace = str(workspace)
+
+    @property
+    def name(self) -> str:
+        return "bash"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Run a bash command in the agent workspace and return its output. "
+            "The command may have side effects; prefer non-interactive flags. "
+            "Large output is truncated with the full output saved to a file."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The bash command to run.",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": f"Timeout in seconds (default {_DEFAULT_TIMEOUT}).",
+                },
+            },
+            "required": ["command"],
+        }
+
+    async def execute(self, **kwargs: Any) -> str:
+        command = kwargs.get("command", "")
+        timeout = int(kwargs.get("timeout") or _DEFAULT_TIMEOUT)
+        if not command.strip():
+            return "Error: empty command."
+
+        refusal = _preflight(command)
+        if refusal:
+            return f"Error: {refusal}"
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "/bin/bash",
+                "-c",
+                command,
+                cwd=self._workspace,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return f"Error: command timed out after {timeout}s: {command}"
+        except OSError as exc:
+            return f"Error: could not run command: {exc}"
+
+        text = out.decode("utf-8", errors="replace")
+        rc = proc.returncode
+        header = f"[exit {rc}]" if rc else ""
+        if len(text) <= _MAX_OUTPUT_CHARS:
+            return f"{header}\n{text}".strip() if header else text
+
+        # Spill full output to a file; return a bounded preview + the path.
+        fd, path = tempfile.mkstemp(prefix="minicode-bash-", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        preview = text[-_MAX_OUTPUT_CHARS:]
+        return (
+            f"{header}\n...output truncated ({len(text)} chars). "
+            f"Full output saved to: {path}\n\n{preview}"
+        ).strip()

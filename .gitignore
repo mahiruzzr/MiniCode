@@ -1,0 +1,32 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Packaging artifacts
+*.egg-info/
+dist/
+build/
+
+# Pytest cache
+.pytest_cache/
+
+# MiniCode local runtime state (sessions, input history, workspace, memory)
+.minicode/
+
+# Project-level config may hold API keys — keep it out of git;
+# configure via ~/.minicode/minicode_config.json or ${ENV_VAR} instead
+minicode_config.json
+
+# Local environment files
+.env
+*.env
+
+# Personal coding-agent setup — never publish:
+# OpenCode skills, agents, commands, plugins (.opencode/)
+# and the Trellis project-management workspace (.trellis/)
+.opencode/
+.trellis/
