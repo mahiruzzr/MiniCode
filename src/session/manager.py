@@ -210,15 +210,16 @@ class SessionManager:
             # Write metadata first
             metadata_line = {
                 "_type": "metadata",
+                "session_id": session.session_id,
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,
             }
-            f.write(json.dumps(metadata_line) + "\n")
+            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
 
             # Write messages
             for msg in session.messages:
-                f.write(json.dumps(msg) + "\n")
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
         self._cache[session.session_id] = session
 
@@ -259,9 +260,10 @@ class SessionManager:
                     if first_line:
                         data = json.loads(first_line)
                         if data.get("_type") == "metadata":
+                            session_id = data.get("session_id", path.stem)
                             sessions.append(
                                 {
-                                    "session_id": path.stem,
+                                    "session_id": session_id,
                                     "created_at": data.get("created_at"),
                                     "updated_at": data.get("updated_at"),
                                     "path": str(path),

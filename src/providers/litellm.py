@@ -11,6 +11,10 @@ from .base import LLMProvider, LLMResponse, ToolCallRequest
 from .registry import find_by_model, find_gateway
 
 
+# Standard OpenAI chat-completion message keys; extras (e.g. reasoning_content) are stripped for strict providers.
+_ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
+
+
 class LiteLLMProvider(LLMProvider):
     """Execute LLM requests through LiteLLM.
 
@@ -76,47 +80,56 @@ class LiteLLMProvider(LLMProvider):
             os.environ.setdefault(env_name, resolved)
 
     def _resolve_model(self, model: str) -> str:
-        """Resolve a MiniCode model name to a LiteLLM model name.
-
-        Args:
-            model: Model name configured in MiniCode.
-
-        Returns:
-            Model name to send to LiteLLM.
-        """
+        """Resolve model name by applying provider/gateway prefixes."""
         if self._gateway:
+            # Gateway mode: apply gateway prefix, skip provider-specific prefixes
             prefix = self._gateway.litellm_prefix
             if self._gateway.strip_model_prefix:
                 model = model.split("/")[-1]
             if prefix and not model.startswith(f"{prefix}/"):
                 model = f"{prefix}/{model}"
             return model
+
+        # Standard mode: auto-prefix for known providers
         spec = find_by_model(model)
         if spec and spec.litellm_prefix:
-            skipped = any(
-                model.startswith(skip) for skip in spec.skip_prefixes
-            )
-            if not skipped:
+            model = self._canonicalize_explicit_prefix(model, spec.name, spec.litellm_prefix)
+            if not any(model.startswith(s) for s in spec.skip_prefixes):
                 model = f"{spec.litellm_prefix}/{model}"
+
         return model
 
-    def _apply_model_overrides(
-        self, model: str, kwargs: dict[str, Any]
-    ) -> None:
-        """Apply registry model overrides to request kwargs.
+    @staticmethod
+    def _canonicalize_explicit_prefix(model: str, spec_name: str, canonical_prefix: str) -> str:
+        """Normalize explicit provider prefixes like `github-copilot/...`."""
+        if "/" not in model:
+            return model
+        prefix, remainder = model.split("/", 1)
+        if prefix.lower().replace("-", "_") != spec_name:
+            return model
+        return f"{canonical_prefix}/{remainder}"
 
-        Args:
-            model: Resolved LiteLLM model name.
-            kwargs: Request kwargs updated in place.
-        """
+    def _apply_model_overrides(self, model: str, kwargs: dict[str, Any]) -> None:
+        """Apply model-specific parameter overrides from the registry."""
+        model_lower = model.lower()
         spec = find_by_model(model)
-        if spec is None:
-            return
-        lowered = model.lower()
-        for pattern, overrides in spec.model_overrides:
-            if pattern in lowered:
-                kwargs.update(overrides)
-                return
+        if spec:
+            for pattern, overrides in spec.model_overrides:
+                if pattern in model_lower:
+                    kwargs.update(overrides)
+                    return
+
+    @staticmethod
+    def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Strip non-standard keys and ensure assistant messages have a content key."""
+        sanitized = []
+        for msg in messages:
+            clean = {k: v for k, v in msg.items() if k in _ALLOWED_MSG_KEYS}
+            # Strict providers require "content" even when assistant only has tool_calls
+            if clean.get("role") == "assistant" and "content" not in clean:
+                clean["content"] = None
+            sanitized.append(clean)
+        return sanitized
 
     async def chat(
         self,
@@ -139,13 +152,20 @@ class LiteLLMProvider(LLMProvider):
             Normalized LLMResponse for the agent layer.
         """
         resolved = self._resolve_model(model or self.default_model)
+
+        # Clamp max_tokens to at least 1 — negative or zero values cause
+        # LiteLLM to reject the request with "max_tokens must be at least 1".
+        max_tokens = max(1, max_tokens)
+
         kwargs: dict[str, Any] = {
             "model": resolved,
-            "messages": messages,
+            "messages": self._sanitize_messages(messages),
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
         self._apply_model_overrides(resolved, kwargs)
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
         if self.api_base:
             kwargs["api_base"] = self.api_base
         if self.extra_headers:
