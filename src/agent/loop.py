@@ -24,6 +24,10 @@ from .skills import SkillTool
 
 logger = logging.getLogger(__name__)
 
+_MICROCOMPACT_KEEP_RECENT = 10
+_MICROCOMPACT_MIN_CHARS = 500
+_COMPACTABLE_TOOLS = frozenset({"bash", "read", "grep", "glob"})
+
 
 class AgentLoop:
     """The agent loop is the core processing engine.
@@ -74,6 +78,33 @@ class AgentLoop:
         self.tools.register(SkillTool(self.context.skills))
         self.tools.register(MemoryTool(workspace=self.workspace))
 
+    @staticmethod
+    def _microcompact(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        compactable_indices: list[int] = []
+        for idx, msg in enumerate(messages):
+            if msg.get("role") == "tool" and msg.get("name") in _COMPACTABLE_TOOLS:
+                compactable_indices.append(idx)
+
+        if len(compactable_indices) <= _MICROCOMPACT_KEEP_RECENT:
+            return messages
+
+        stale = compactable_indices[
+            : len(compactable_indices) - _MICROCOMPACT_KEEP_RECENT
+        ]
+        updated: list[dict[str, Any]] | None = None
+        for idx in stale:
+            msg = messages[idx]
+            content = msg.get("content")
+            if not isinstance(content, str) or len(content) < _MICROCOMPACT_MIN_CHARS:
+                continue
+            name = msg.get("name", "tool")
+            summary = f"[{name} result omitted from context]"
+            if updated is None:
+                updated = [dict(m) for m in messages]
+            updated[idx]["content"] = summary
+
+        return updated if updated is not None else messages
+
     async def run(
         self,
         content: str,
@@ -119,7 +150,7 @@ class AgentLoop:
             iteration += 1
 
             response = await self.provider.chat(
-                messages=messages,
+                messages=self._microcompact(messages),
                 tools=self.tools.get_definitions(),
                 model=self.model,
             )
