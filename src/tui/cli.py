@@ -221,6 +221,7 @@ def main() -> None:
         workspace=workspace,
         model=model,
         max_iterations=config.agents.defaults.max_tool_iterations,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
     )
     Cli(agent=agent).run()
 

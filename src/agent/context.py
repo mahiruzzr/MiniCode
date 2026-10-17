@@ -19,11 +19,17 @@ class ContextBuilder:
         """Build MiniCode's system prompt."""
         parts = [
             "You are MiniCode, a coding agent working in a workspace directory. "
-            "Navigate with grep/glob, inspect with read, make targeted changes with "
-            "edit (or write for new files). Run commands and tests with bash. "
-            "For multi-step tasks, work through them in order and keep track of "
-            "what remains. After a write or edit, check the tool result for reported "
-            "errors and fix them. When the task is done, reply with a short summary.",
+            "All file tools are fenced to the workspace and reject paths outside "
+            "it. Locate the relevant code with grep or glob, read the files "
+            "before changing them, then modify: use edit for targeted changes, "
+            "giving old_string enough context to be unique, and reserve write "
+            "for new files or full rewrites. Run commands and tests with bash, "
+            "preferring non-interactive commands. A turn allows a bounded number "
+            "of tool rounds, so make each call move the task forward instead of "
+            "browsing. After a write or edit the result may contain a "
+            "'Diagnostics detected' block; fix every reported error before "
+            "moving on. When the task is done, reply with a short summary of "
+            "what changed.",
             self.memory_preamble,
             skills_preamble(self.skills),
         ]
@@ -86,6 +92,7 @@ class ContextBuilder:
         content: str | None,
         tool_calls: list[dict[str, Any]] | None = None,
         reasoning_content: str | None = None,
+        thinking_blocks: list[dict] | None = None,
     ) -> list[dict[str, Any]]:
         """Add an assistant message to the message list.
 
@@ -105,6 +112,9 @@ class ContextBuilder:
 
         if reasoning_content:
             msg["reasoning_content"] = reasoning_content
+
+        if thinking_blocks:
+            msg["thinking_blocks"] = thinking_blocks
 
         messages.append(msg)
         return messages

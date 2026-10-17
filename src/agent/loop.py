@@ -47,6 +47,7 @@ class AgentLoop:
         model: str | None = None,
         max_iterations: int = 20,
         session_manager: SessionManager | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         """Initialize the agent loop.
 
@@ -57,11 +58,14 @@ class AgentLoop:
             max_iterations: Maximum provider calls per run.
             session_manager: Session manager. A new one is created
                 when omitted.
+            reasoning_effort: Reasoning effort hint forwarded to the
+                provider on every chat call.
         """
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
+        self.reasoning_effort = reasoning_effort
         self.sessions = session_manager or SessionManager()
         self.context = ContextBuilder(workspace)
         self.tools = ToolRegistry()
@@ -153,6 +157,7 @@ class AgentLoop:
                 messages=self._microcompact(messages),
                 tools=self.tools.get_definitions(),
                 model=self.model,
+                reasoning_effort=self.reasoning_effort,
             )
 
             if response.has_tool_calls:
@@ -174,6 +179,7 @@ class AgentLoop:
                     response.content,
                     tool_call_dicts,
                     reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
                 )
                 session.add_message(
                     "assistant",

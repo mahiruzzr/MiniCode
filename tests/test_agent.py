@@ -17,6 +17,7 @@ class FakeProvider(LLMProvider):
         super().__init__()
         self.script = list(script)
         self.seen: list[list[dict[str, Any]]] = []
+        self.reasoning_efforts: list[str | None] = []
 
     async def chat(
         self,
@@ -25,7 +26,9 @@ class FakeProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning_effort: str | None = None,
     ) -> LLMResponse:
+        self.reasoning_efforts.append(reasoning_effort)
         self.seen.append(list(messages))
         return self.script.pop(0)
 
@@ -180,6 +183,32 @@ async def test_persistence_and_reload(isolated_home: Path, tmp_path: Path) -> No
     assert history[1]["tool_calls"][0]["id"] == "c9"
     assert history[2]["tool_call_id"] == "c9"
     assert history[2]["name"] == "bash"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_fields_flow_to_provider(
+    isolated_home: Path, tmp_path: Path
+) -> None:
+    """reasoning_effort reaches the provider; thinking fields ride in-turn."""
+    runner, provider = _runner(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[_call("c1", "bash", {"command": "true"})],
+                reasoning_content="why",
+                thinking_blocks=[{"type": "thinking", "thinking": "why"}],
+            ),
+            LLMResponse(content="done"),
+        ],
+        tmp_path,
+        reasoning_effort="high",
+    )
+    assert await runner.run("go", session_id="flow1") == "done"
+    assert provider.reasoning_efforts == ["high", "high"]
+
+    # Second provider round carries the assistant thinking fields.
+    assert provider.seen[1][2]["reasoning_content"] == "why"
+    assert provider.seen[1][2]["thinking_blocks"][0]["thinking"] == "why"
 
 
 @pytest.mark.asyncio

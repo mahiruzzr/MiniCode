@@ -14,6 +14,8 @@ class AgentDefaults(BaseModel):
     max_tokens: int = 8192
     temperature: float = 0.7
     max_tool_iterations: int = 20
+    # Reasoning effort forwarded to reasoning-capable models (None = unset).
+    reasoning_effort: str | None = None
 
 
 class AgentsConfig(BaseModel):
