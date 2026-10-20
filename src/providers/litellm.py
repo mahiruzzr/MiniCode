@@ -140,6 +140,7 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
         """Send a chat completion request via LiteLLM.
 
@@ -149,6 +150,9 @@ class LiteLLMProvider(LLMProvider):
             model: Model identifier, defaults to default_model.
             max_tokens: Maximum tokens in the response.
             temperature: Sampling temperature.
+            reasoning_effort: Reasoning effort hint forwarded to LiteLLM.
+            tool_choice: Tool selection policy forwarded to LiteLLM.
+                Defaults to "auto" when tools are provided.
 
         Returns:
             Normalized LLMResponse for the agent layer.
@@ -177,7 +181,7 @@ class LiteLLMProvider(LLMProvider):
             kwargs["drop_params"] = True
         if tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            kwargs["tool_choice"] = tool_choice or "auto"
         try:
             response = await acompletion(**kwargs)
             return self._parse_response(response)

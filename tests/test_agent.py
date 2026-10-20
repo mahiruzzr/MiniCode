@@ -18,6 +18,7 @@ class FakeProvider(LLMProvider):
         self.script = list(script)
         self.seen: list[list[dict[str, Any]]] = []
         self.reasoning_efforts: list[str | None] = []
+        self.tool_choices: list[str | dict[str, Any] | None] = []
 
     async def chat(
         self,
@@ -27,8 +28,10 @@ class FakeProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
         self.reasoning_efforts.append(reasoning_effort)
+        self.tool_choices.append(tool_choice)
         self.seen.append(list(messages))
         return self.script.pop(0)
 
@@ -209,6 +212,36 @@ async def test_reasoning_fields_flow_to_provider(
     # Second provider round carries the assistant thinking fields.
     assert provider.seen[1][2]["reasoning_content"] == "why"
     assert provider.seen[1][2]["thinking_blocks"][0]["thinking"] == "why"
+
+
+@pytest.mark.asyncio
+async def test_tool_choice_flows_to_provider_on_every_round(
+    isolated_home: Path, tmp_path: Path
+) -> None:
+    """A caller-supplied tool_choice reaches every provider round unchanged."""
+    runner, provider = _runner(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[_call("c1", "bash", {"command": "true"})],
+            ),
+            LLMResponse(content="done"),
+        ],
+        tmp_path,
+    )
+    choice = {"type": "function", "function": {"name": "bash"}}
+    assert await runner.run("go", tool_choice=choice) == "done"
+    assert provider.tool_choices == [choice, choice]
+
+
+@pytest.mark.asyncio
+async def test_tool_choice_defaults_to_none(
+    isolated_home: Path, tmp_path: Path
+) -> None:
+    """Omitting tool_choice leaves provider defaults untouched."""
+    runner, provider = _runner([LLMResponse(content="ok")], tmp_path)
+    assert await runner.run("hi") == "ok"
+    assert provider.tool_choices == [None]
 
 
 @pytest.mark.asyncio

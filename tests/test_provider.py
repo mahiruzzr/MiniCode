@@ -189,3 +189,70 @@ async def test_chat_request_shape(monkeypatch: pytest.MonkeyPatch) -> None:
     assert seen["model"] == "gpt-4o"
     assert seen["tool_choice"] == "auto"
     assert len(seen["tools"]) == 1
+
+
+async def _capture_chat(
+    monkeypatch: pytest.MonkeyPatch,
+    **chat_kwargs: Any,
+) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+
+    async def fake_call(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return _response(content="ok")
+
+    monkeypatch.setattr(litellm_module, "acompletion", fake_call)
+    await LiteLLMProvider().chat(
+        [{"role": "user", "content": "hi"}],
+        model="gpt-4o",
+        **chat_kwargs,
+    )
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_chat_tool_choice_none_keeps_auto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """None keeps the pre-existing auto policy when tools are sent."""
+    seen = await _capture_chat(
+        monkeypatch,
+        tools=[{"type": "function", "function": {"name": "bash"}}],
+    )
+    assert seen["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_chat_tool_choice_string_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A string policy reaches acompletion untouched."""
+    seen = await _capture_chat(
+        monkeypatch,
+        tools=[{"type": "function", "function": {"name": "bash"}}],
+        tool_choice="required",
+    )
+    assert seen["tool_choice"] == "required"
+
+
+@pytest.mark.asyncio
+async def test_chat_tool_choice_dict_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dict policy reaches acompletion with every field intact."""
+    choice = {"type": "function", "function": {"name": "bash"}}
+    seen = await _capture_chat(
+        monkeypatch,
+        tools=[{"type": "function", "function": {"name": "bash"}}],
+        tool_choice=choice,
+    )
+    assert seen["tool_choice"] == choice
+
+
+@pytest.mark.asyncio
+async def test_chat_tool_choice_ignored_without_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tool_choice is not sent when no tools are defined."""
+    seen = await _capture_chat(monkeypatch, tool_choice="required")
+    assert "tool_choice" not in seen

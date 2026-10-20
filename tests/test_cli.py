@@ -29,6 +29,7 @@ class FakeProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
         self.seen.append(list(messages))
         next_item = self.script.pop(0)

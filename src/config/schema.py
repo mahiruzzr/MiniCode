@@ -15,7 +15,7 @@ class AgentDefaults(BaseModel):
     temperature: float = 0.7
     max_tool_iterations: int = 20
     # Reasoning effort forwarded to reasoning-capable models (None = unset).
-    reasoning_effort: str | None = None
+    reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
 
 
 class AgentsConfig(BaseModel):

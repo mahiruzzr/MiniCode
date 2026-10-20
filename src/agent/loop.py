@@ -116,6 +116,7 @@ class AgentLoop:
         *,
         on_tool_start: Callable[[str, dict[str, Any]], None] | None = None,
         on_tool_result: Callable[[str, str, bool], None] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> str:
         """Process a user message and return the final response.
 
@@ -127,6 +128,9 @@ class AgentLoop:
                 (tool_name, tool_input) before each tool executes.
             on_tool_result: Optional callback invoked with
                 (tool_name, output, is_error) after each tool executes.
+            tool_choice: Tool selection policy forwarded to the
+                provider on every round. Provider defaults apply when
+                omitted.
 
         Returns:
             The final assistant response.
@@ -158,6 +162,7 @@ class AgentLoop:
                 tools=self.tools.get_definitions(),
                 model=self.model,
                 reasoning_effort=self.reasoning_effort,
+                tool_choice=tool_choice,
             )
 
             if response.has_tool_calls:

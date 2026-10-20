@@ -87,11 +87,15 @@ class Tool(ABC):
             for k, v in val.items():
                 if k in props:
                     errors.extend(self._validate(v, props[k], path + "." + k if path else k))
-        if t == "array" and "items" in schema:
-            for i, item in enumerate(val):
-                errors.extend(
-                    self._validate(item, schema["items"], f"{path}[{i}]" if path else f"[{i}]")
-                )
+        if t == "array":
+            if "minItems" in schema and len(val) < schema["minItems"]:
+                errors.append(f"{label} must have at least {schema['minItems']} items")
+            if "maxItems" in schema and len(val) > schema["maxItems"]:
+                errors.append(f"{label} must have at most {schema['maxItems']} items")
+            if "items" in schema:
+                prefix = f"{path}[{{}}]" if path else "[{}]"
+                for i, item in enumerate(val):
+                    errors.extend(self._validate(item, schema["items"], prefix.format(i)))
         return errors
 
     def to_schema(self) -> dict[str, Any]:
