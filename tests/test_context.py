@@ -125,7 +125,6 @@ def test_no_nonexistent_tool_names(tmp_path: Path) -> None:
     """Base prompt names no unimplemented tools or frameworks."""
     prompt = ContextBuilder(tmp_path).build_system_prompt()
     for banned in (
-        "apply_patch",
         "update_plan",
         "ask_user",
         "spawn_agent",
@@ -133,6 +132,13 @@ def test_no_nonexistent_tool_names(tmp_path: Path) -> None:
         "web_fetch",
     ):
         assert banned not in prompt
+
+
+def test_prompt_mentions_apply_patch(tmp_path: Path) -> None:
+    """The prompt points the model at apply_patch for multi-file changes."""
+    prompt = ContextBuilder(tmp_path).build_system_prompt()
+    assert "apply_patch" in prompt
+    assert "several files" in prompt
 
 
 def test_build_messages_shape(tmp_path: Path) -> None:

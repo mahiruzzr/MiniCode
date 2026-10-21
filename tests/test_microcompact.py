@@ -157,7 +157,9 @@ def test_each_compactable_tool_is_compacted(name: str) -> None:
     assert result[0]["content"] == _placeholder(name)
 
 
-@pytest.mark.parametrize("name", ["write", "edit", "skill", "memory", "unknown-tool"])
+@pytest.mark.parametrize(
+    "name", ["write", "edit", "apply_patch", "skill", "memory", "unknown-tool"]
+)
 def test_non_compactable_tools_are_untouched(name: str) -> None:
     """Results outside the whitelist keep their content even when it is long."""
     messages = [_tool_message(name, "z" * 600)] + _recent_results(11)
@@ -174,6 +176,7 @@ def test_compactable_tools_match_registered_tools(
     runner, _ = _runner([], tmp_path)
     registered = {d["function"]["name"] for d in runner.tools.get_definitions()}
     assert registered == {
+        "apply_patch",
         "bash",
         "edit",
         "glob",

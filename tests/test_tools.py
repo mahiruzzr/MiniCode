@@ -1,11 +1,13 @@
-"""Tests for the Tool contract, registry, and the six tools."""
+"""Tests for the Tool contract, registry, and the built-in tools."""
 
 from typing import Any
 
 import pytest
 
 from tools.base import Tool
+from tools.diagnostics import Diagnostic
 from tools.files import EditTool, ReadTool, WriteTool
+from tools.patch import ApplyPatchTool, PatchError, parse_patch
 from tools.registry import ToolRegistry
 from tools.search import GlobTool, GrepTool
 from tools.shell import BashTool
@@ -261,3 +263,458 @@ async def test_glob_no_files(search_workspace: str) -> None:
     """Empty globs say so plainly."""
     result = await GlobTool(workspace=search_workspace).execute(pattern="*.zzz")
     assert result == "No files matched."
+
+
+def _no_diagnostics(_path: str) -> list[Diagnostic]:
+    """Diagnostics stub that reports nothing."""
+    return []
+
+
+def _patch_tool(workspace: str) -> ApplyPatchTool:
+    """Build an apply_patch tool with diagnostics switched off."""
+    return ApplyPatchTool(workspace=workspace, diagnostics=_no_diagnostics)
+
+
+class RecordingDiagnostics:
+    """Diagnostics stub that records the paths it was asked to check."""
+
+    def __init__(self, diagnostics: list[Diagnostic] | None = None) -> None:
+        self.paths: list[str] = []
+        self._diagnostics = diagnostics if diagnostics is not None else []
+
+    def __call__(self, path: str) -> list[Diagnostic]:
+        self.paths.append(path)
+        return self._diagnostics
+
+
+def test_apply_patch_identity(tmp_path) -> None:
+    """The tool takes a single patch argument."""
+    tool = _patch_tool(str(tmp_path))
+    assert tool.name == "apply_patch"
+    assert tool.parameters["required"] == ["patch"]
+    assert "patch" in tool.parameters["properties"]
+
+
+def test_parse_patch_reads_every_directive() -> None:
+    """Add, Update, Delete, and Move parse into ordered file operations."""
+    ops = parse_patch(
+        "*** Begin Patch\n"
+        "*** Add File: new.py\n"
+        "+print(1)\n"
+        "*** Update File: old.py\n"
+        "*** Move to: moved.py\n"
+        "@@ def f():\n"
+        " def f():\n"
+        "-    return 1\n"
+        "+    return 2\n"
+        "*** Delete File: gone.py\n"
+        "*** End Patch"
+    )
+    assert [op.kind for op in ops] == ["add", "update", "delete"]
+    assert ops[0].path == "new.py"
+    assert ops[0].add_content == "print(1)"
+    assert ops[1].path == "old.py"
+    assert ops[1].move_to == "moved.py"
+    assert ops[1].hunks[0].before == "def f():\n    return 1"
+    assert ops[1].hunks[0].after == "def f():\n    return 2"
+    assert ops[2].path == "gone.py"
+
+
+def test_parse_patch_requires_begin_sentinel() -> None:
+    """A patch without the opening sentinel is rejected."""
+    with pytest.raises(PatchError, match="must start with"):
+        parse_patch("*** Add File: x\n+hi\n")
+
+
+def test_parse_patch_rejects_unknown_directive() -> None:
+    """Unknown directives are reported instead of ignored."""
+    with pytest.raises(PatchError, match="unexpected patch directive"):
+        parse_patch("*** Begin Patch\n*** Frobnicate File: x\n*** End Patch")
+
+
+def test_parse_patch_rejects_update_without_changes() -> None:
+    """An update holding only context lines has nothing to apply."""
+    with pytest.raises(PatchError, match="no change hunks"):
+        parse_patch("*** Begin Patch\n*** Update File: x\n@@\n keep me\n*** End Patch")
+
+
+def test_parse_patch_rejects_patch_without_operations() -> None:
+    """A patch with no directives carries no work."""
+    with pytest.raises(PatchError, match="no file operations"):
+        parse_patch("*** Begin Patch\n*** End Patch")
+
+
+def test_parse_patch_splits_hunks_on_at_marker() -> None:
+    """Every '@@' line starts a new hunk."""
+    ops = parse_patch(
+        "*** Begin Patch\n"
+        "*** Update File: x\n"
+        "@@\n"
+        "-a\n"
+        "+b\n"
+        "@@\n"
+        "-c\n"
+        "+d\n"
+        "*** End Patch"
+    )
+    assert [(hunk.before, hunk.after) for hunk in ops[0].hunks] == [
+        ("a", "b"),
+        ("c", "d"),
+    ]
+
+
+def test_parse_patch_keeps_at_header_out_of_the_match() -> None:
+    """The '@@' header separates hunks; it is not a match anchor."""
+    ops = parse_patch(
+        "*** Begin Patch\n"
+        "*** Update File: x\n"
+        "@@ totally wrong anchor\n"
+        "-a\n"
+        "+b\n"
+        "*** End Patch"
+    )
+    assert ops[0].hunks[0].before == "a"
+
+
+def test_parse_patch_normalizes_line_endings() -> None:
+    """CRLF patches parse the same as LF patches."""
+    crlf = parse_patch(
+        "*** Begin Patch\r\n*** Add File: x\r\n+hello\r\n*** End Patch\r\n"
+    )
+    lf = parse_patch("*** Begin Patch\n*** Add File: x\n+hello\n*** End Patch")
+    assert crlf[0].add_content == lf[0].add_content == "hello"
+
+
+def test_parse_patch_keeps_directive_like_text_inside_add_body() -> None:
+    """Prefixed add lines keep their text, even when it looks like a directive."""
+    ops = parse_patch(
+        "*** Begin Patch\n"
+        "*** Add File: x\n"
+        "+before\n"
+        "+*** not a directive\n"
+        "+after\n"
+        "*** End Patch"
+    )
+    assert ops[0].add_content == "before\n*** not a directive\nafter"
+
+
+def test_parse_patch_rejects_raw_directive_line_in_add_body() -> None:
+    """An unprefixed '*** ' line inside an add body is read as a directive.
+
+    Known limitation: add bodies must prefix each line with '+' or ' ' so
+    the parser can tell content from directives.
+    """
+    with pytest.raises(PatchError, match="unexpected patch directive"):
+        parse_patch(
+            "*** Begin Patch\n"
+            "*** Add File: r.txt\n"
+            "+before\n"
+            "*** raw line\n"
+            "*** End Patch"
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_adds_file(tmp_path) -> None:
+    """An Add directive creates the file and its parent directories."""
+    ws = str(tmp_path)
+    result = await _patch_tool(ws).execute(
+        patch=(
+            "*** Begin Patch\n"
+            "*** Add File: sub/new.txt\n"
+            "+line1\n"
+            "+line2\n"
+            "*** End Patch"
+        )
+    )
+    assert result.startswith("Applied patch: 1 change(s)")
+    assert (tmp_path / "sub" / "new.txt").read_text(encoding="utf-8") == "line1\nline2"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_updates_file_by_context(tmp_path) -> None:
+    """An Update hunk replaces the span its context selects."""
+    ws = str(tmp_path)
+    (tmp_path / "a.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    result = await _patch_tool(ws).execute(
+        patch=(
+            "*** Begin Patch\n"
+            "*** Update File: a.py\n"
+            "@@ def f():\n"
+            " def f():\n"
+            "-    return 1\n"
+            "+    return 2\n"
+            "*** End Patch"
+        )
+    )
+    assert result.startswith("Applied patch: 1 change(s)")
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "def f():\n    return 2\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_deletes_file(tmp_path) -> None:
+    """A Delete directive removes the file."""
+    ws = str(tmp_path)
+    (tmp_path / "d.txt").write_text("x\n", encoding="utf-8")
+    result = await _patch_tool(ws).execute(
+        patch="*** Begin Patch\n*** Delete File: d.txt\n*** End Patch"
+    )
+    assert "d.txt (deleted)" in result
+    assert not (tmp_path / "d.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_moves_file(tmp_path) -> None:
+    """A Move directive renames the file and keeps the edited content."""
+    ws = str(tmp_path)
+    (tmp_path / "old.py").write_text("body\n", encoding="utf-8")
+    result = await _patch_tool(ws).execute(
+        patch=(
+            "*** Begin Patch\n"
+            "*** Update File: old.py\n"
+            "*** Move to: new.py\n"
+            "@@\n"
+            " body\n"
+            "+more\n"
+            "*** End Patch"
+        )
+    )
+    assert "new.py" in result
+    assert not (tmp_path / "old.py").exists()
+    assert (tmp_path / "new.py").read_text(encoding="utf-8") == "body\nmore\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_changes_multiple_files(tmp_path) -> None:
+    """One patch can add and update different files in a single call."""
+    ws = str(tmp_path)
+    (tmp_path / "m1.txt").write_text("one\n", encoding="utf-8")
+    result = await _patch_tool(ws).execute(
+        patch=(
+            "*** Begin Patch\n"
+            "*** Add File: m2.txt\n"
+            "+two\n"
+            "*** Update File: m1.txt\n"
+            "@@\n"
+            "-one\n"
+            "+ONE\n"
+            "*** End Patch"
+        )
+    )
+    assert result.startswith("Applied patch: 2 change(s)")
+    assert (tmp_path / "m1.txt").read_text(encoding="utf-8") == "ONE\n"
+    assert (tmp_path / "m2.txt").read_text(encoding="utf-8") == "two"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_rejects_path_outside_workspace(tmp_path) -> None:
+    """Paths that escape the workspace are refused."""
+    ws = str(tmp_path)
+    result = await _patch_tool(ws).execute(
+        patch="*** Begin Patch\n*** Add File: ../escape.txt\n+bad\n*** End Patch"
+    )
+    assert result.startswith("Error:")
+    assert "outside the workspace" in result
+    assert not (tmp_path.parent / "escape.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_rejects_move_outside_workspace(tmp_path) -> None:
+    """A move target outside the workspace is refused and the file stays put."""
+    ws = str(tmp_path)
+    (tmp_path / "m.py").write_text("x\n", encoding="utf-8")
+    result = await _patch_tool(ws).execute(
+        patch=(
+            "*** Begin Patch\n"
+            "*** Update File: m.py\n"
+            "*** Move to: ../out.py\n"
+            "@@\n"
+            " x\n"
+            "+y\n"
+            "*** End Patch"
+        )
+    )
+    assert result.startswith("Error:")
+    assert "refusing to move" in result
+    assert not (tmp_path.parent / "out.py").exists()
+    assert (tmp_path / "m.py").read_text(encoding="utf-8") == "x\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_rejects_adding_existing_file(tmp_path) -> None:
+    """Adding over an existing file points at the update directive."""
+    ws = str(tmp_path)
+    (tmp_path / "e.txt").write_text("x\n", encoding="utf-8")
+    result = await _patch_tool(ws).execute(
+        patch="*** Begin Patch\n*** Add File: e.txt\n+y\n*** End Patch"
+    )
+    assert result.startswith("Error:")
+    assert "already exists" in result
+    assert (tmp_path / "e.txt").read_text(encoding="utf-8") == "x\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_rejects_deleting_missing_file(tmp_path) -> None:
+    """Deleting a file that is not there reports the miss."""
+    result = await _patch_tool(str(tmp_path)).execute(
+        patch="*** Begin Patch\n*** Delete File: gone.txt\n*** End Patch"
+    )
+    assert result.startswith("Error:")
+    assert "file not found" in result
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_rejects_updating_missing_file(tmp_path) -> None:
+    """Updating a file that is not there points at the add directive."""
+    result = await _patch_tool(str(tmp_path)).execute(
+        patch="*** Begin Patch\n*** Update File: gone.txt\n@@\n-a\n+b\n*** End Patch"
+    )
+    assert result.startswith("Error:")
+    assert "file not found" in result
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_reports_unmatched_hunk(tmp_path) -> None:
+    """A hunk that matches nothing leaves the file untouched."""
+    ws = str(tmp_path)
+    (tmp_path / "u.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+    result = await _patch_tool(ws).execute(
+        patch="*** Begin Patch\n*** Update File: u.txt\n@@\n-nope\n+yes\n*** End Patch"
+    )
+    assert result.startswith("Error:")
+    assert "Could not find old_string" in result
+    assert (tmp_path / "u.txt").read_text(encoding="utf-8") == "alpha\nbeta\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_reports_ambiguous_hunk(tmp_path) -> None:
+    """A hunk matching several places asks for more context."""
+    ws = str(tmp_path)
+    (tmp_path / "m.txt").write_text("dup\nx\ndup\n", encoding="utf-8")
+    result = await _patch_tool(ws).execute(
+        patch="*** Begin Patch\n*** Update File: m.txt\n@@\n-dup\n+unique\n*** End Patch"
+    )
+    assert result.startswith("Error:")
+    assert "multiple matches" in result
+    assert (tmp_path / "m.txt").read_text(encoding="utf-8") == "dup\nx\ndup\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_rejects_hunk_without_anchor(tmp_path) -> None:
+    """A hunk made of added lines only has nothing to match on.
+
+    Known limitation: the matcher needs at least one context or removed
+    line to anchor the span, so the hunk is refused instead of applied.
+    """
+    ws = str(tmp_path)
+    (tmp_path / "p.txt").write_text("alpha\n", encoding="utf-8")
+    result = await _patch_tool(ws).execute(
+        patch="*** Begin Patch\n*** Update File: p.txt\n@@\n+brand new\n*** End Patch"
+    )
+    assert result.startswith("Error:")
+    assert "old_string cannot be empty" in result
+    assert (tmp_path / "p.txt").read_text(encoding="utf-8") == "alpha\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_rejects_blank_patch(tmp_path) -> None:
+    """A blank patch never reaches the parser."""
+    result = await _patch_tool(str(tmp_path)).execute(patch="   \n  ")
+    assert result == "Error: patch is empty."
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_skips_writes_when_validation_fails(tmp_path) -> None:
+    """A later failing operation aborts the patch before anything is written."""
+    ws = str(tmp_path)
+    result = await _patch_tool(ws).execute(
+        patch=(
+            "*** Begin Patch\n"
+            "*** Add File: first.txt\n"
+            "+ok\n"
+            "*** Update File: missing.txt\n"
+            "@@\n"
+            "-a\n"
+            "+b\n"
+            "*** End Patch"
+        )
+    )
+    assert result.startswith("Error:")
+    assert not (tmp_path / "first.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_keeps_earlier_edits_when_validation_fails(tmp_path) -> None:
+    """A failed operation also rolls back earlier edits of the same patch."""
+    ws = str(tmp_path)
+    (tmp_path / "keep.txt").write_text("x\n", encoding="utf-8")
+    result = await _patch_tool(ws).execute(
+        patch=(
+            "*** Begin Patch\n"
+            "*** Update File: keep.txt\n"
+            "@@\n"
+            "-x\n"
+            "+y\n"
+            "*** Add File: ../escape.txt\n"
+            "+bad\n"
+            "*** End Patch"
+        )
+    )
+    assert result.startswith("Error:")
+    assert (tmp_path / "keep.txt").read_text(encoding="utf-8") == "x\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_checks_diagnostics_of_written_files(tmp_path) -> None:
+    """Diagnostics run against every file the patch writes."""
+    ws = str(tmp_path)
+    recorder = RecordingDiagnostics()
+    tool = ApplyPatchTool(workspace=ws, diagnostics=recorder)
+    await tool.execute(
+        patch="*** Begin Patch\n*** Add File: diag.py\n+x = 1\n*** End Patch"
+    )
+    assert recorder.paths == [str(tmp_path / "diag.py")]
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_checks_diagnostics_of_move_destination(tmp_path) -> None:
+    """A move reports diagnostics for the new path."""
+    ws = str(tmp_path)
+    (tmp_path / "src.py").write_text("x\n", encoding="utf-8")
+    recorder = RecordingDiagnostics()
+    tool = ApplyPatchTool(workspace=ws, diagnostics=recorder)
+    await tool.execute(
+        patch=(
+            "*** Begin Patch\n"
+            "*** Update File: src.py\n"
+            "*** Move to: dst.py\n"
+            "@@\n"
+            " x\n"
+            "+y\n"
+            "*** End Patch"
+        )
+    )
+    assert recorder.paths == [str(tmp_path / "dst.py")]
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_reports_diagnostics_in_result(tmp_path) -> None:
+    """Diagnostics findings are appended to the tool result."""
+    ws = str(tmp_path)
+    recorder = RecordingDiagnostics(
+        [
+            Diagnostic(
+                line=1,
+                column=1,
+                severity="error",
+                message="undefined name",
+                source="py_compile",
+            )
+        ]
+    )
+    tool = ApplyPatchTool(workspace=ws, diagnostics=recorder)
+    result = await tool.execute(
+        patch="*** Begin Patch\n*** Add File: bad.py\n+x = 1\n*** End Patch"
+    )
+    assert "Diagnostics detected" in result
+    assert "undefined name" in result

@@ -87,10 +87,54 @@ def _assert_tool_calls_paired(messages: list[dict[str, Any]]) -> None:
 def test_default_tools_include_memory_and_skill(
     isolated_home: Path, tmp_path: Path
 ) -> None:
-    """AgentLoop exposes memory and skill alongside the six base tools."""
+    """AgentLoop exposes apply_patch, memory, and skill with the base tools."""
     runner, _ = _runner([LLMResponse(content="hi")], tmp_path)
     names = sorted(d["function"]["name"] for d in runner.tools.get_definitions())
-    assert names == ["bash", "edit", "glob", "grep", "memory", "read", "skill", "write"]
+    assert names == [
+        "apply_patch",
+        "bash",
+        "edit",
+        "glob",
+        "grep",
+        "memory",
+        "read",
+        "skill",
+        "write",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_tool_is_registered_and_executes(
+    isolated_home: Path, tmp_path: Path
+) -> None:
+    """apply_patch is exposed, receives the workspace, and dispatches normally."""
+    patch = (
+        "*** Begin Patch\n"
+        "*** Add File: generated.txt\n"
+        "+from patch\n"
+        "*** End Patch"
+    )
+    runner, provider = _runner(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[_call("p1", "apply_patch", {"patch": patch})],
+            ),
+            LLMResponse(content="patched"),
+        ],
+        tmp_path,
+    )
+    definitions = {
+        d["function"]["name"]: d["function"] for d in runner.tools.get_definitions()
+    }
+    assert "apply_patch" in definitions
+    assert definitions["apply_patch"]["parameters"]["required"] == ["patch"]
+
+    assert await runner.run("go") == "patched"
+    assert (tmp_path / "generated.txt").read_text(encoding="utf-8") == "from patch"
+    result = provider.seen[1][-1]
+    assert result["name"] == "apply_patch"
+    assert result["content"].startswith("Applied patch: 1 change(s)")
 
 
 @pytest.mark.asyncio

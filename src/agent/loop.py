@@ -9,7 +9,8 @@ from typing import Any
 from agent.context import ContextBuilder
 from providers.base import LLMProvider
 from session.manager import SessionManager
-from tools import (    
+from tools import (
+    ApplyPatchTool,
     BashTool,
     EditTool,
     GlobTool,
@@ -76,6 +77,7 @@ class AgentLoop:
         self.tools.register(ReadTool(workspace=self.workspace))
         self.tools.register(WriteTool(workspace=self.workspace))
         self.tools.register(EditTool(workspace=self.workspace))
+        self.tools.register(ApplyPatchTool(workspace=self.workspace))
         self.tools.register(BashTool(workspace=self.workspace))
         self.tools.register(GrepTool(workspace=self.workspace))
         self.tools.register(GlobTool(workspace=self.workspace))
