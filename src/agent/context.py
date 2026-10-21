@@ -6,62 +6,62 @@ from typing import Any
 from .memory import system_preamble
 from .skills import SkillRegistry, discover_skills, skills_preamble
 
+_BASE_PROMPT = (
+    "You are MiniCode, a coding agent working in a workspace directory. "
+    "The write, edit, and apply_patch tools reject paths outside it; bash "
+    "runs with the workspace as its working directory.\n\n"
+    "Use grep or glob to locate code, then read the complete region you "
+    "intend to change. read is paginated, so keep reading until you have "
+    "enough context. Parallelize independent reads and searches; wait for "
+    "their results before dependent steps. Keep the change minimal and "
+    "consistent with the surrounding code; do not refactor, rename, or "
+    "reformat unrelated code.\n\n"
+    "Use edit for a focused change, write only for a new file or a full "
+    "rewrite, and apply_patch when one change spans several files or must "
+    "land atomically. Run shell commands non-interactively; do not start "
+    "commands that wait for input.\n\n"
+    "Verify with the narrowest check that can fail: a focused test, type "
+    "check, build, or run. Then run the broader suite when it is cheap and "
+    "relevant. If a command fails, read the error and change your approach; "
+    "do not repeat an identical failing call. When write, edit, or "
+    "apply_patch reports diagnostics, fix reported errors before continuing."
+    "\n\n"
+    "Act with tools instead of narrating the next step. A turn ends when "
+    "you answer without a tool call, and each request allows only a limited "
+    "number of tool rounds. Finish with a short summary of what changed, "
+    "where, and what you ran. Report checks you did not run and any "
+    "remaining blocker. Never claim a check passed unless you ran it."
+)
+
 
 class ContextBuilder:
-    """Builds the context (system prompt + messages) for the agent."""
+    """Build the session-stable system prompt and per-turn messages."""
 
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
-        self.memory_preamble = system_preamble(workspace)
         self.skills: SkillRegistry = discover_skills(workspace)
+        parts = (
+            _BASE_PROMPT,
+            system_preamble(workspace),
+            skills_preamble(self.skills),
+        )
+        self._system_prompt = "\n\n".join(part for part in parts if part)
 
     def build_system_prompt(self) -> str:
-        """Build MiniCode's system prompt."""
-        parts = [
-            (
-                "You are MiniCode, a coding agent working in a workspace "
-                "directory. All file tools are fenced to the workspace and "
-                "reject paths outside it. Locate the relevant code with grep "
-                "or glob, read the files before changing them, then modify: "
-                "use edit for targeted changes, giving old_string enough "
-                "context to be unique, reserve write for new files or full "
-                "rewrites, and use apply_patch when one change spans several "
-                "files or several places that must land together. Run "
-                "commands and tests with bash, preferring non-interactive "
-                "commands. A turn allows a bounded number of tool rounds, so "
-                "make each call move the task forward instead of browsing. "
-                "After a write, edit, or apply_patch the result may contain a "
-                "'Diagnostics detected' block; fix every reported error "
-                "before moving on. When the task is done, reply with a short "
-                "summary of what changed."
-            ),
-            self.memory_preamble,
-            skills_preamble(self.skills),
-        ]
-
-        return "\n\n".join(part for part in parts if part)
+        """Return the session-stable system prompt."""
+        return self._system_prompt
 
     def build_messages(
         self,
         history: list[dict[str, Any]],
         current_message: str,
     ) -> list[dict[str, Any]]:
-        """Build the complete message list for an LLM call.
-
-        Args:
-            history: Previous conversation messages.
-            current_message: The new user message.
-
-        Returns:
-            List of messages including system prompt.
-        """
-        messages = []
-        messages.append(
-            {"role": "system", "content": self.build_system_prompt()}
-        )
-        messages.extend(history)
-        messages.append({"role": "user", "content": current_message})
-        return messages
+        """Return system, history, and current user messages."""
+        return [
+            {"role": "system", "content": self.build_system_prompt()},
+            *history,
+            {"role": "user", "content": current_message},
+        ]
 
     def add_tool_result(
         self,
@@ -70,17 +70,7 @@ class ContextBuilder:
         tool_name: str,
         result: str,
     ) -> list[dict[str, Any]]:
-        """Add a tool result to the message list.
-
-        Args:
-            messages: Current message list.
-            tool_call_id: ID of the tool call.
-            tool_name: Name of the tool.
-            result: Tool execution result.
-
-        Returns:
-            Updated message list.
-        """
+        """Append a tool result and return the message list."""
         messages.append(
             {
                 "role": "tool",
@@ -97,27 +87,15 @@ class ContextBuilder:
         content: str | None,
         tool_calls: list[dict[str, Any]] | None = None,
         reasoning_content: str | None = None,
-        thinking_blocks: list[dict] | None = None,
+        thinking_blocks: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
-        """Add an assistant message to the message list.
-
-        Args:
-            messages: Current message list.
-            content: Message content.
-            tool_calls: Optional tool calls.
-            reasoning_content: Thinking model output.
-
-        Returns:
-            Updated message list.
-        """
+        """Append an assistant message and return the message list."""
         msg: dict[str, Any] = {"role": "assistant", "content": content or ""}
 
         if tool_calls:
             msg["tool_calls"] = tool_calls
-
         if reasoning_content:
             msg["reasoning_content"] = reasoning_content
-
         if thinking_blocks:
             msg["thinking_blocks"] = thinking_blocks
 
