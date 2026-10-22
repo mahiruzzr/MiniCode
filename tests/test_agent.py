@@ -84,10 +84,10 @@ def _assert_tool_calls_paired(messages: list[dict[str, Any]]) -> None:
     assert answered == declared
 
 
-def test_default_tools_include_memory_and_skill(
+def test_default_tools_include_plan_memory_and_skill(
     isolated_home: Path, tmp_path: Path
 ) -> None:
-    """AgentLoop exposes apply_patch, memory, and skill with the base tools."""
+    """AgentLoop exposes plan, apply_patch, memory, and skill with base tools."""
     runner, _ = _runner([LLMResponse(content="hi")], tmp_path)
     names = sorted(d["function"]["name"] for d in runner.tools.get_definitions())
     assert names == [
@@ -99,6 +99,7 @@ def test_default_tools_include_memory_and_skill(
         "memory",
         "read",
         "skill",
+        "update_plan",
         "write",
     ]
 
@@ -135,6 +136,41 @@ async def test_apply_patch_tool_is_registered_and_executes(
     result = provider.seen[1][-1]
     assert result["name"] == "apply_patch"
     assert result["content"].startswith("Applied patch: 1 change(s)")
+
+
+@pytest.mark.asyncio
+async def test_update_plan_tool_is_registered_and_executes(
+    isolated_home: Path, tmp_path: Path
+) -> None:
+    """update_plan is exposed and dispatches through the registry."""
+    plan = [
+        {"step": "inspect", "status": "completed"},
+        {"step": "integrate", "status": "in_progress"},
+        {"step": "test", "status": "pending"},
+    ]
+    runner, provider = _runner(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[_call("u1", "update_plan", {"plan": plan})],
+            ),
+            LLMResponse(content="planned"),
+        ],
+        tmp_path,
+    )
+    definitions = {
+        d["function"]["name"]: d["function"] for d in runner.tools.get_definitions()
+    }
+    assert "update_plan" in definitions
+    assert definitions["update_plan"]["parameters"]["required"] == ["plan"]
+
+    assert await runner.run("go") == "planned"
+    result = provider.seen[1][-1]
+    assert result["name"] == "update_plan"
+    assert result["content"].startswith("Plan updated (1/3 done)")
+    assert "☑ inspect" in result["content"]
+    assert "▶ integrate" in result["content"]
+    assert "☐ test" in result["content"]
 
 
 @pytest.mark.asyncio

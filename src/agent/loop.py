@@ -17,6 +17,7 @@ from tools import (
     GrepTool,
     ReadTool,
     ToolRegistry,
+    UpdatePlanTool,
     WriteTool,
 )
 
@@ -83,6 +84,7 @@ class AgentLoop:
         self.tools.register(GlobTool(workspace=self.workspace))
         self.tools.register(SkillTool(self.context.skills))
         self.tools.register(MemoryTool(workspace=self.workspace))
+        self.tools.register(UpdatePlanTool())
 
     @staticmethod
     def _microcompact(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -3,6 +3,7 @@
 from .base import Tool
 from .files import EditTool, ReadTool, WriteTool
 from .patch import ApplyPatchTool
+from .plan import UpdatePlanTool
 from .registry import ToolRegistry
 from .search import GlobTool, GrepTool
 from .shell import BashTool
@@ -17,4 +18,5 @@ __all__ = [
     "ApplyPatchTool",
     "GrepTool",
     "GlobTool",
+    "UpdatePlanTool",
 ]

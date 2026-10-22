@@ -184,6 +184,7 @@ def test_compactable_tools_match_registered_tools(
         "memory",
         "read",
         "skill",
+        "update_plan",
         "write",
     }
     assert _COMPACTABLE_TOOLS == frozenset({"bash", "read", "grep", "glob"})
