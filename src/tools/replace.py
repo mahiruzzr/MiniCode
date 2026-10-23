@@ -1,35 +1,35 @@
-"""Fuzzy string-replacement engine for the edit tool (P2).
+"""Fuzzy string-replacement engine used by the edit and apply_patch tools.
 
-A faithful Python port of opencode's nine-strategy replacer ladder (itself
-distilled from cline / gemini-cli edit correctors). Exact-string edits fail
-constantly on whitespace, indentation, and line-ending drift; this ladder
-tries progressively looser matching strategies until one locates the intended
-span, while refusing matches that are disproportionately larger than what the
-model asked to replace.
+Exact-string edits often fail on whitespace, indentation, escaping, or
+line-ending drift. This module tries an ordered ladder of replacement
+strategies until one produces a candidate that exists in the content, is a
+plausible size, and (unless replacing all occurrences) is unique.
 
-Design (unchanged from the reference):
+A replacer is a generator ``(content, find) -> Iterator[str]`` that yields
+candidate substrings of ``content``. ``replace`` validates each candidate, so
+replacers only propose matches and do not handle uniqueness or size limits
+themselves.
 
-* A *replacer* is a generator ``(content, find) -> Iterator[str]`` that yields
-  candidate substrings of ``content`` that could be the match for ``find``.
-* :func:`replace` tries the replacers in order; for each yielded candidate it
-  checks the candidate actually occurs in ``content``, guards against a
-  disproportionate match, and (unless ``replace_all``) requires the candidate
-  to be unique before applying the replacement.
-
-Pure functions, no I/O — the whole ladder is unit-testable in isolation.
+The module contains pure functions with no I/O, which keeps the ladder
+testable in isolation.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 
-# Similarity thresholds for the block-anchor fallback.
+# Minimum block-anchor similarity for a lone candidate, and for the
+# best-scoring candidate when several exist.
 _SINGLE_CANDIDATE_SIMILARITY_THRESHOLD = 0.65
 _MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD = 0.65
 
 
 class ReplaceError(ValueError):
-    """Base class for edit-replacement failures (surfaced to the model)."""
+    """Base class for replacement failures returned to the model as errors.
+
+    Subclasses distinguish a missing match, an ambiguous match, and a match
+    that is implausibly larger than the requested text.
+    """
 
 
 class NotFoundError(ReplaceError):
@@ -45,6 +45,7 @@ class DisproportionateMatchError(ReplaceError):
 
 
 def _levenshtein(a: str, b: str) -> int:
+    """Return the Levenshtein edit distance between ``a`` and ``b``."""
     if a == "" or b == "":
         return max(len(a), len(b))
     prev = list(range(len(b) + 1))
@@ -58,7 +59,11 @@ def _levenshtein(a: str, b: str) -> int:
 
 
 def _span(lines: list[str], start: int, end: int) -> str:
-    """Reconstruct ``\\n``-joined ``lines[start..end]`` as the exact substring."""
+    """Return half-open character offsets covering lines ``start..end``.
+
+    The line range is inclusive, and the returned range is half-open, so
+    slicing the newline-joined content yields exactly those lines.
+    """
     start_index = sum(len(lines[k]) + 1 for k in range(start))
     end_index = start_index
     for k in range(start, end + 1):
@@ -68,14 +73,20 @@ def _span(lines: list[str], start: int, end: int) -> str:
     return start_index, end_index
 
 
-# --- the nine replacers ----------------------------------------------------
+# --- replacer ladder, tried in order ---------------------------------------
 
 
 def simple_replacer(content: str, find: str) -> Iterator[str]:
+    """Yield ``find`` unchanged: the exact-match strategy."""
     yield find
 
 
 def line_trimmed_replacer(content: str, find: str) -> Iterator[str]:
+    """Match a line-aligned block after trimming each line.
+
+    A trailing newline in ``find`` is ignored, and the remaining lines must
+    match one-for-one.
+    """
     original = content.split("\n")
     search = find.split("\n")
     if search and search[-1] == "":
@@ -89,6 +100,13 @@ def line_trimmed_replacer(content: str, find: str) -> Iterator[str]:
 
 
 def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
+    """Match a block by anchoring on its first and last trimmed lines.
+
+    Intended for blocks of three or more lines. Candidate line counts may
+    drift by at most a quarter of the requested size (minimum one line), and
+    interior lines are scored by normalized Levenshtein similarity. A lone
+    candidate, or the best of several, must reach the corresponding threshold.
+    """
     original = content.split("\n")
     search = find.split("\n")
     if len(search) < 3:
@@ -138,7 +156,7 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
     best = None
     best_sim = -1.0
     for start, end in candidates:
-        # Multi-candidate uses an averaged (non-early-exit) similarity.
+        # Compare every candidate and keep the highest average similarity.
         actual = end - start + 1
         to_check = min(block_size - 2, actual - 2)
         if to_check <= 0:
@@ -162,12 +180,19 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
 
 
 def _normalize_ws(text: str) -> str:
+    """Collapse all whitespace runs, including newlines, and trim the ends."""
     import re
 
     return re.sub(r"\s+", " ", text).strip()
 
 
 def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
+    """Match text while ignoring differences in whitespace.
+
+    Whitespace runs are collapsed when comparing a single line or a
+    line-aligned block. A single-line substring can also be located by
+    matching the words of ``find`` against arbitrary whitespace.
+    """
     import re
 
     normalized_find = _normalize_ws(find)
@@ -194,6 +219,12 @@ def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
 
 
 def indentation_flexible_replacer(content: str, find: str) -> Iterator[str]:
+    """Match a line-aligned block after removing common leading indentation.
+
+    Both ``find`` and each candidate block are dedented by their minimum
+    non-empty indentation; the line count and all remaining text must match
+    exactly.
+    """
     import re
 
     def _dedent(text: str) -> str:
@@ -214,9 +245,16 @@ def indentation_flexible_replacer(content: str, find: str) -> Iterator[str]:
 
 
 def escape_normalized_replacer(content: str, find: str) -> Iterator[str]:
+    """Match text after interpreting backslash escapes in ``find``.
+
+    The unescaped text is tried literally, then compared against line-aligned
+    blocks that are also decoded. This lets ``\\n`` written as two characters
+    match a real newline in the content.
+    """
     import re
 
     def _unescape(s: str) -> str:
+        # Keys match the regex alternatives; self-mappings drop the backslash.
         mapping = {
             "n": "\n",
             "t": "\t",
@@ -246,6 +284,11 @@ def escape_normalized_replacer(content: str, find: str) -> Iterator[str]:
 
 
 def trimmed_boundary_replacer(content: str, find: str) -> Iterator[str]:
+    """Match text after stripping whitespace from the outer boundaries.
+
+    Only whitespace at the start and end of the match is ignored; whitespace
+    inside the match must still be exact.
+    """
     trimmed = find.strip()
     if trimmed == find:
         return
@@ -260,6 +303,12 @@ def trimmed_boundary_replacer(content: str, find: str) -> Iterator[str]:
 
 
 def context_aware_replacer(content: str, find: str) -> Iterator[str]:
+    """Match a same-length block by its boundaries and interior agreement.
+
+    The first and last lines must match after stripping. At least half of the
+    interior line pairs that are not both blank must also match exactly. This
+    tolerates limited interior edits after stricter strategies fail.
+    """
     find_lines = find.split("\n")
     if len(find_lines) < 3:
         return
@@ -291,6 +340,11 @@ def context_aware_replacer(content: str, find: str) -> Iterator[str]:
 
 
 def multi_occurrence_replacer(content: str, find: str) -> Iterator[str]:
+    """Yield ``find`` once per non-overlapping literal occurrence.
+
+    Assumes ``find`` is non-empty; ``replace`` rejects empty searches before
+    running the ladder.
+    """
     start = 0
     while True:
         index = content.find(find, start)
@@ -314,6 +368,13 @@ _REPLACERS = (
 
 
 def _is_disproportionate(search: str, old_string: str) -> bool:
+    """Return True when ``search`` is implausibly larger than ``old_string``.
+
+    The line-count guard rejects candidates with at least
+    ``max(old_lines + 3, old_lines * 2)`` lines. Multi-line searches also
+    reject candidates whose stripped length exceeds
+    ``max(old_stripped_len + 500, old_stripped_len * 4)``.
+    """
     old_lines = len(old_string.split("\n"))
     search_lines = len(search.split("\n"))
     if search_lines >= max(old_lines + 3, old_lines * 2):
@@ -333,15 +394,20 @@ def replace(
 ) -> str:
     """Return ``content`` with ``old_string`` replaced by ``new_string``.
 
-    Tries nine matching strategies in order. Raises:
+    Replacers are tried in order. Candidates that do not occur in ``content``
+    are skipped, while an occurring candidate that is disproportionately
+    larger than ``old_string`` raises immediately. Unless ``replace_all`` is
+    set, the candidate must also be unique; otherwise the next candidate or
+    strategy is tried. With ``replace_all``, the first accepted candidate is
+    passed to ``str.replace`` to replace every occurrence.
 
-    * :class:`ValueError` if ``old_string == new_string`` or ``old_string`` is
-      empty (callers should use write for a full-file replacement);
-    * :class:`NotFoundError` if no strategy locates the text;
-    * :class:`MultipleMatchesError` if the text is ambiguous (and not
-      ``replace_all``);
-    * :class:`DisproportionateMatchError` if the matched span is far larger
-      than ``old_string`` (a signal the model guessed loosely).
+    Raises:
+        ValueError: ``old_string`` is empty or identical to ``new_string``.
+        NotFoundError: No yielded candidate occurs in ``content``.
+        MultipleMatchesError: No candidate is unique and ``replace_all`` is
+            false.
+        DisproportionateMatchError: An occurring candidate is far larger than
+            ``old_string``.
     """
     if old_string == new_string:
         raise ValueError(

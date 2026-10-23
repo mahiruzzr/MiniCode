@@ -1,16 +1,15 @@
-"""Post-edit diagnostics — the edit->verify loop (P2).
+"""Post-write diagnostics for the ``write``, ``edit``, and ``apply_patch`` tools.
 
-After a write/edit, run fast checkers on the changed file and feed any errors
-straight back into the tool result, so the model fixes mistakes in the same
-turn instead of discovering them later (opencode's edit->LSP idea, adapted).
+After a file is written, the tool checks it with every checker registered for
+its extension and appends the findings to the tool result. This lets the model
+fix mistakes in the same turn instead of discovering them later.
 
-No hardcoded ``if ext == ".py"`` branching: checkers live in a declarative
-registry keyed by file extension. Adding a language = adding a ``Checker`` to
-the registry. A checker that isn't installed (``is_available()`` false) is
-silently skipped, so the loop degrades gracefully and never blocks an edit.
-
-Checks are non-executing (syntax/lint only): ``py_compile`` compiles without
-running, ``node --check`` parses without running — safe to run on every edit.
+Checkers are selected from a declarative registry rather than hardcoded
+extension branches, so supporting a language means adding a ``Checker``.
+Optional tools that are not installed are skipped, and a checker that raises
+is ignored: diagnostics must never block an edit. All checks are static:
+Python files are compiled without being executed, JavaScript files are parsed
+with ``node --check``, and ``ruff`` performs linting.
 """
 
 from __future__ import annotations
@@ -23,15 +22,26 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Diagnostic:
+    """A finding produced by a single checker.
+
+    ``line`` and ``column`` are 1-based when known; either may be ``None`` if
+    the checker cannot determine it. ``source`` names the reporting checker.
+    """
+
     line: int | None
     column: int | None
     severity: str  # "error" | "warning"
     message: str
-    source: str  # which checker produced it
+    source: str
 
 
 class Checker:
-    """A language checker. Subclasses declare extensions + how to run."""
+    """Base class for extension-scoped diagnostic checkers.
+
+    Subclasses declare the ``extensions`` they handle and implement ``check``.
+    ``is_available`` is a hook for optional tools; checkers that report
+    ``False`` are skipped.
+    """
 
     name: str = "checker"
     extensions: tuple[str, ...] = ()
@@ -47,7 +57,11 @@ class Checker:
 
 
 class PyCompileChecker(Checker):
-    """Always-available Python syntax check (compiles, does not execute)."""
+    """Python syntax checker backed by ``py_compile``.
+
+    Always available for ``.py`` files. Compilation does not execute the
+    module, but it may write a bytecode cache entry next to the source.
+    """
 
     name = "py_compile"
     extensions = (".py",)
@@ -59,6 +73,8 @@ class PyCompileChecker(Checker):
             py_compile.compile(path, doraise=True)
             return []
         except py_compile.PyCompileError as exc:
+            # The wrapper holds the underlying exception; prefer its position
+            # and message when they are present.
             inner = getattr(exc, "exc_value", None)
             line = getattr(inner, "lineno", None)
             col = getattr(inner, "offset", None)
@@ -72,7 +88,7 @@ class PyCompileChecker(Checker):
                     source=self.name,
                 )
             ]
-        except (SyntaxError, ValueError) as exc:  # defensive
+        except (SyntaxError, ValueError) as exc:  # fallback when not wrapped
             return [
                 Diagnostic(
                     line=getattr(exc, "lineno", None),
@@ -85,7 +101,10 @@ class PyCompileChecker(Checker):
 
 
 class NodeCheckChecker(Checker):
-    """JavaScript syntax check via ``node --check`` (parses, does not execute)."""
+    """JavaScript syntax checker that parses with ``node --check``.
+
+    The file is never executed. Skipped when ``node`` is not installed.
+    """
 
     name = "node --check"
     extensions = (".js", ".mjs", ".cjs")
@@ -105,7 +124,7 @@ class NodeCheckChecker(Checker):
             return []
         if proc.returncode == 0:
             return []
-        # stderr: "<file>:<line>\n<code>\n^\n\nSyntaxError: <message>"
+        # node emits a "<file>:<line>" header and the message on the last line.
         line = None
         message = (
             proc.stderr.strip().splitlines()[-1]
@@ -130,7 +149,11 @@ class NodeCheckChecker(Checker):
 
 
 class RuffChecker(Checker):
-    """Optional richer Python lint via ruff (skipped when not installed)."""
+    """Optional Python linter backed by ``ruff check``.
+
+    Every finding is reported as a warning. Skipped when ``ruff`` is not
+    installed.
+    """
 
     name = "ruff"
     extensions = (".py",)
@@ -148,6 +171,7 @@ class RuffChecker(Checker):
             )
         except (OSError, subprocess.TimeoutExpired):
             return []
+        # ruff exits non-zero when it finds issues, so rely on stdout, not the status.
         try:
             items = json.loads(proc.stdout or "[]")
         except json.JSONDecodeError:
@@ -178,7 +202,11 @@ DEFAULT_CHECKERS: tuple[Checker, ...] = (
 def run_diagnostics(
     path: str, checkers: tuple[Checker, ...] = DEFAULT_CHECKERS
 ) -> list[Diagnostic]:
-    """Run every applicable + available checker on ``path``; collect results."""
+    """Run every applicable, available checker on ``path``.
+
+    Findings are returned in checker order. Exceptions from a checker are
+    suppressed so diagnostics cannot break the edit that triggered them.
+    """
     out: list[Diagnostic] = []
     for checker in checkers:
         if not checker.applies_to(path) or not checker.is_available():
@@ -191,7 +219,11 @@ def run_diagnostics(
 
 
 def format_diagnostics(diagnostics: list[Diagnostic]) -> str:
-    """Render diagnostics as a compact block appended to a tool result."""
+    """Render findings as a block to append to a tool result.
+
+    Returns an empty string when there are no findings. The header separates
+    actionable errors from lint-only warnings.
+    """
     if not diagnostics:
         return ""
     errors = [d for d in diagnostics if d.severity == "error"]
