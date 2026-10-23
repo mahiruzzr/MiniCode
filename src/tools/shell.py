@@ -7,6 +7,8 @@ import os
 import tempfile
 from typing import Any
 
+from sandbox import build_exec_command
+
 from .base import Tool
 
 _MAX_OUTPUT_CHARS = 30_000
@@ -49,9 +51,9 @@ class BashTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Run a bash command in the agent workspace and return its output. "
-            "The command may have side effects; prefer non-interactive flags. "
-            "Large output is truncated with the full output saved to a file."
+            "Run a bash command in the workspace (sandboxed: writes are fenced "
+            "to the workspace). Prefer non-interactive flags; large output is "
+            "truncated with the full output saved to a file."
         )
 
     @property
@@ -81,11 +83,10 @@ class BashTool(Tool):
         if refusal:
             return f"Error: {refusal}"
 
+        wrapped = build_exec_command(command=command, workspace=self._workspace)
         try:
             proc = await asyncio.create_subprocess_exec(
-                "/bin/bash",
-                "-c",
-                command,
+                *wrapped.argv,
                 cwd=self._workspace,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -98,6 +99,8 @@ class BashTool(Tool):
                 return f"Error: command timed out after {timeout}s: {command}"
         except OSError as exc:
             return f"Error: could not run command: {exc}"
+        finally:
+            wrapped.cleanup()
 
         text = out.decode("utf-8", errors="replace")
         rc = proc.returncode
