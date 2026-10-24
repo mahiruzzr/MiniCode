@@ -46,6 +46,7 @@ class Session:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
+    last_consolidated: int = 0  # Number of messages already consolidated to files
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -53,38 +54,59 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
-    def get_history(self, max_messages: int = 50) -> list[dict[str, Any]]:
-        """
-        Get message history for LLM context.
+    @staticmethod
+    def _find_legal_start(messages: list[dict[str, Any]]) -> int:
+        """Find first index where every tool result has a matching assistant tool_call."""
+        declared: set[str] = set()
+        start = 0
+        for i, msg in enumerate(messages):
+            role = msg.get("role")
+            if role == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        declared.add(str(tc["id"]))
+            elif role == "tool":
+                tid = msg.get("tool_call_id")
+                if tid and str(tid) not in declared:
+                    start = i + 1
+                    declared.clear()
+                    for prev in messages[start:i + 1]:
+                        if prev.get("role") == "assistant":
+                            for tc in prev.get("tool_calls") or []:
+                                if isinstance(tc, dict) and tc.get("id"):
+                                    declared.add(str(tc["id"]))
+        return start
 
-        Args:
-            max_messages: Maximum messages to return.
+    def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
+        """Return unconsolidated messages for LLM input, aligned to a legal tool-call boundary."""
+        unconsolidated = self.messages[self.last_consolidated:]
+        sliced = unconsolidated[-max_messages:]
 
-        Returns:
-            List of messages in LLM format, preserving tool-call
-            metadata while dropping session-internal fields.
-        """
-        # Get recent messages
-        recent = (
-            self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
-        )
+        # Drop leading non-user messages to avoid starting mid-turn when possible.
+        for i, message in enumerate(sliced):
+            if message.get("role") == "user":
+                sliced = sliced[i:]
+                break
 
-        # Convert to LLM format, keeping tool-call fields for the provider.
-        history = []
-        for m in recent:
-            msg = {
-                "role": m["role"],
-                "content": m.get("content", ""),
-            }
+        # Some providers reject orphan tool results if the matching assistant
+        # tool_calls message fell outside the fixed-size history window.
+        start = self._find_legal_start(sliced)
+        if start:
+            sliced = sliced[start:]
+
+        out: list[dict[str, Any]] = []
+        for message in sliced:
+            entry: dict[str, Any] = {"role": message["role"], "content": message.get("content", "")}
             for key in ("tool_calls", "tool_call_id", "name"):
-                if key in m:
-                    msg[key] = m[key]
-            history.append(msg)
-        return history
+                if key in message:
+                    entry[key] = message[key]
+            out.append(entry)
+        return out
 
     def clear(self) -> None:
         """Clear all messages in the session."""
         self.messages = []
+        self.last_consolidated = 0
         self.updated_at = datetime.now()
 
 
@@ -188,6 +210,7 @@ class SessionManager:
                             if data.get("updated_at")
                             else None
                         )
+                        last_consolidated = data.get("last_consolidated", 0)
                     else:
                         messages.append(data)
 
@@ -197,6 +220,7 @@ class SessionManager:
                 created_at=created_at or datetime.now(),
                 updated_at=updated_at or datetime.now(),
                 metadata=metadata,
+                last_consolidated=last_consolidated
             )
         except Exception as e:
             logger.warning(f"Failed to load session {session_id}: {e}")
@@ -214,6 +238,7 @@ class SessionManager:
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,
+                "last_consolidated": session.last_consolidated
             }
             f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
 

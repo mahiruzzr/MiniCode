@@ -114,6 +114,66 @@ def test_resolve_model_passthrough() -> None:
     assert provider._resolve_model("some-unknown-model") == "some-unknown-model"
 
 
+def test_cache_control_supported_by_anthropic_only() -> None:
+    """Explicit cache_control is enabled only for providers that support it."""
+    provider = LiteLLMProvider()
+    assert provider._supports_cache_control("claude-sonnet-4") is True
+    assert provider._supports_cache_control("gpt-4o") is False
+    assert provider._supports_cache_control("unknown-model-zzz") is False
+
+
+def test_cache_control_supported_by_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gateway support follows the gateway's prompt caching flag."""
+    spec = ProviderSpec(name="gateway", is_gateway=True, supports_prompt_caching=True)
+    monkeypatch.setattr(litellm_module, "find_gateway", lambda *args, **kwargs: spec)
+    provider = LiteLLMProvider()
+    assert provider._supports_cache_control("gpt-4o") is True
+
+
+def test_apply_cache_control_wraps_system_text_and_last_tool() -> None:
+    """System text becomes a cached text block and only the last tool is marked."""
+    provider = LiteLLMProvider()
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "hi"},
+    ]
+    tools = [
+        {"type": "function", "function": {"name": "bash"}},
+        {"type": "function", "function": {"name": "read"}},
+    ]
+    new_messages, new_tools = provider._apply_cache_control(messages, tools)
+    assert messages[0]["content"] == "rules"
+    assert new_messages[0]["content"] == [
+        {"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}
+    ]
+    assert new_messages[1] == {"role": "user", "content": "hi"}
+    assert new_tools is not None
+    assert "cache_control" not in tools[-1]
+    assert "cache_control" not in new_tools[0]
+    assert new_tools[1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_apply_cache_control_updates_last_system_block() -> None:
+    """List content marks only the last system block and leaves the input alone."""
+    provider = LiteLLMProvider()
+    messages = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "one"},
+                {"type": "text", "text": "two"},
+            ],
+        }
+    ]
+    new_messages, new_tools = provider._apply_cache_control(messages, None)
+    assert new_tools is None
+    assert new_messages[0]["content"] == [
+        {"type": "text", "text": "one"},
+        {"type": "text", "text": "two", "cache_control": {"type": "ephemeral"}},
+    ]
+    assert messages[0]["content"][1] == {"type": "text", "text": "two"}
+
+
 def test_setup_env_uses_registry_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """API keys land in the registry-declared env var without clobbering."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -146,6 +206,28 @@ def test_parse_tool_calls() -> None:
     assert parsed.tool_calls[0].arguments == {"command": "ls"}
     assert parsed.tool_calls[1].arguments == {"raw": "{oops"}
     assert parsed.has_tool_calls is True
+
+
+def test_parse_tool_calls_generates_short_alphanumeric_ids() -> None:
+    """Parsed tool calls get fresh 9-character IDs and preserve other fields."""
+    provider = LiteLLMProvider()
+    parsed = provider._parse_response(
+        _response(
+            content=None,
+            tool_calls=[_tool_call("provider-id", "bash", '{"command": "ls"}')],
+            finish="tool_calls",
+        )
+    )
+    call = parsed.tool_calls[0]
+    assert call.id != "provider-id"
+    assert len(call.id) == 9
+    assert call.id.isascii()
+    assert call.id.isalnum()
+    assert call.name == "bash"
+    assert call.arguments == {"command": "ls"}
+    assert parsed.content is None
+    assert parsed.finish_reason == "tool_calls"
+    assert parsed.usage == {}
 
 
 def test_parse_usage_and_reasoning() -> None:
@@ -208,6 +290,60 @@ async def _capture_chat(
         **chat_kwargs,
     )
     return seen
+
+
+@pytest.mark.asyncio
+async def test_chat_injects_cache_control_for_anthropic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anthropic requests carry cached system content and tool definitions."""
+    seen: dict[str, Any] = {}
+
+    async def fake_call(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return _response(content="ok")
+
+    monkeypatch.setattr(litellm_module, "acompletion", fake_call)
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "hi"},
+    ]
+    tools = [{"type": "function", "function": {"name": "bash"}}]
+    result = await LiteLLMProvider().chat(
+        messages,
+        tools=tools,
+        model="claude-sonnet-4",
+    )
+    assert result.content == "ok"
+    assert seen["messages"][0]["content"] == [
+        {"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}
+    ]
+    assert seen["tools"][0]["cache_control"] == {"type": "ephemeral"}
+    assert messages[0]["content"] == "rules"
+    assert "cache_control" not in tools[0]
+
+
+@pytest.mark.asyncio
+async def test_chat_skips_cache_control_for_openai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenAI requests keep their original system content and tools."""
+    seen: dict[str, Any] = {}
+
+    async def fake_call(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return _response(content="ok")
+
+    monkeypatch.setattr(litellm_module, "acompletion", fake_call)
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "hi"},
+    ]
+    tools = [{"type": "function", "function": {"name": "bash"}}]
+    result = await LiteLLMProvider().chat(messages, tools=tools, model="gpt-4o")
+    assert result.content == "ok"
+    assert seen["messages"][0]["content"] == "rules"
+    assert "cache_control" not in seen["tools"][0]
 
 
 @pytest.mark.asyncio

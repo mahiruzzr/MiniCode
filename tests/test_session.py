@@ -1,5 +1,7 @@
 """Tests for Session persistence and history."""
 
+from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -17,6 +19,7 @@ def test_create_and_get(isolated_home) -> None:
     first = manager.create_session()
     second = manager.create_session()
     assert first.session_id and first.session_id != second.session_id
+    assert first.last_consolidated == 0
     assert manager.get_session(first.session_id) is first
     assert manager.get_session("missing") is None
 
@@ -31,15 +34,25 @@ def test_explicit_id_and_collision(isolated_home) -> None:
 
 
 def test_save_reload_roundtrip(isolated_home) -> None:
-    """Messages and metadata survive disk reload."""
+    """Messages, metadata, and consolidation offset survive disk reload."""
     manager = _manager(isolated_home)
     session = manager.create_session(metadata={"k": "v"})
+    session.add_message("user", "old question")
+    session.add_message("assistant", "old answer")
     session.add_message("user", "hi")
+    session.last_consolidated = 2
     manager.save(session)
+
     reloaded = SessionManager().get_session(session.session_id)
+
     assert reloaded.metadata == {"k": "v"}
-    assert [m["role"] for m in reloaded.messages] == ["user"]
-    assert reloaded.messages[0]["content"] == "hi"
+    assert reloaded.last_consolidated == 2
+    assert [message["content"] for message in reloaded.messages] == [
+        "old question",
+        "old answer",
+        "hi",
+    ]
+    assert reloaded.get_history() == [{"role": "user", "content": "hi"}]
 
 
 def test_history_keeps_tool_metadata(isolated_home) -> None:
@@ -120,25 +133,26 @@ def _assert_window_paired(window: list[dict[str, Any]]) -> None:
 
 
 @pytest.mark.parametrize(
-    ("total", "limit", "expected"),
-    [(10, 10, 10), (5, 10, 5), (25, 10, 10)],
-    ids=["at-limit", "under-limit", "over-limit"],
+    ("total", "limit", "first_index", "expected_length"),
+    [(10, 10, 0, 10), (5, 10, 0, 5), (25, 10, 16, 9)],
+    ids=["at-limit", "under-limit", "starts-on-assistant"],
 )
-def test_history_without_tool_calls_keeps_window(
-    isolated_home, total: int, limit: int, expected: int
+def test_history_without_tool_calls_starts_at_first_user(
+    isolated_home: Path, total: int, limit: int, first_index: int, expected_length: int
 ) -> None:
-    """A conversation without tool calls keeps the plain last-N window."""
+    """A clipped plain history begins at its first user message when available."""
     session = Session(session_id="plain")
     for i in range(total):
         session.add_message("user" if i % 2 == 0 else "assistant", f"m{i}")
 
     history = session.get_history(max_messages=limit)
 
-    assert len(history) == expected
+    assert len(history) == expected_length
     assert [m["content"] for m in history] == [
-        f"m{i}" for i in range(total - expected, total)
+        f"m{i}" for i in range(first_index, total)
     ]
-    assert all("tool_calls" not in m for m in history)
+    assert history[0]["role"] == "user"
+    assert all("tool_calls" not in message for message in history)
 
 
 def test_history_boundary_between_normal_messages(isolated_home) -> None:
@@ -158,32 +172,23 @@ def test_history_boundary_between_normal_messages(isolated_home) -> None:
     _assert_window_paired(history)
 
 
-def test_history_boundary_inside_single_tool_group(isolated_home) -> None:
-    """Plain clipping starts the window on the result without its call."""
+def test_history_boundary_inside_single_tool_group(isolated_home: Path) -> None:
+    """A clipped history drops a result whose tool call is outside the window."""
     session = Session(session_id="single-group")
-    session.messages.append({"role": "user", "content": "u0"})
     session.messages.append(_assistant(("c1",)))
     session.messages.append(_result("c1"))
-    session.messages.append({"role": "user", "content": "u3"})
+    session.messages.append({"role": "assistant", "content": "done"})
 
     history = session.get_history(max_messages=2)
 
-    assert [m["role"] for m in history] == ["tool", "user"]
-    assert [m["content"] for m in history] == ["out-c1", "u3"]
+    assert history == [{"role": "assistant", "content": "done"}]
 
 
-@pytest.mark.parametrize(
-    ("limit", "roles", "contents"),
-    [
-        (1, ["tool"], ["out-p3"]),
-        (2, ["tool", "tool"], ["out-p2", "out-p3"]),
-        (3, ["tool", "tool", "tool"], ["out-p1", "out-p2", "out-p3"]),
-    ],
-)
+@pytest.mark.parametrize("limit", [1, 2, 3])
 def test_history_boundary_inside_parallel_group(
-    isolated_home, limit: int, roles: list[str], contents: list[str]
+    isolated_home: Path, limit: int
 ) -> None:
-    """Plain clipping may start anywhere, even inside a parallel group."""
+    """A window containing only parallel results drops every orphan result."""
     session = Session(session_id="parallel")
     session.messages.append({"role": "user", "content": "u0"})
     session.messages.append(_assistant(("p1", "p2", "p3")))
@@ -193,8 +198,7 @@ def test_history_boundary_inside_parallel_group(
 
     history = session.get_history(max_messages=limit)
 
-    assert [m["role"] for m in history] == roles
-    assert [m["content"] for m in history] == contents
+    assert history == []
 
 
 def test_history_parallel_group_intact_when_calls_included(isolated_home) -> None:
@@ -215,22 +219,57 @@ def test_history_parallel_group_intact_when_calls_included(isolated_home) -> Non
 
 
 @pytest.mark.parametrize(
-    ("limit", "roles", "first_call"),
+    ("limit", "expected_roles", "expected_tool_ids"),
     [
-        (9, ["tool", "assistant", "tool", "assistant", "tool", "tool",
-             "user", "user", "user"], "r0"),
-        (8, ["assistant", "tool", "assistant", "tool", "tool",
-             "user", "user", "user"], "r1"),
-        (7, ["tool", "assistant", "tool", "tool", "user", "user", "user"],
-         "r1"),
-        (6, ["assistant", "tool", "tool", "user", "user", "user"], "r2a"),
-        (5, ["tool", "tool", "user", "user", "user"], "r2a"),
+        (
+            9,
+            [
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+                "tool",
+                "assistant",
+                "tool",
+                "tool",
+                "assistant",
+            ],
+            ["r0", "r1", "r2a", "r2b"],
+        ),
+        (
+            8,
+            [
+                "assistant",
+                "tool",
+                "assistant",
+                "tool",
+                "assistant",
+                "tool",
+                "tool",
+                "assistant",
+            ],
+            ["r0", "r1", "r2a", "r2b"],
+        ),
+        (
+            7,
+            ["assistant", "tool", "assistant", "tool", "tool", "assistant"],
+            ["r1", "r2a", "r2b"],
+        ),
+        (
+            6,
+            ["assistant", "tool", "assistant", "tool", "tool", "assistant"],
+            ["r1", "r2a", "r2b"],
+        ),
+        (5, ["assistant", "tool", "tool", "assistant"], ["r2a", "r2b"]),
     ],
 )
-def test_history_multiple_tool_rounds(
-    isolated_home, limit: int, roles: list[str], first_call: str
+def test_history_multiple_tool_rounds_keep_legal_boundaries(
+    isolated_home: Path,
+    limit: int,
+    expected_roles: list[str],
+    expected_tool_ids: list[str],
 ) -> None:
-    """Plain last-N clipping can start a window inside a tool round."""
+    """Clipping removes orphan results and preserves later tool exchanges."""
     session = Session(session_id="rounds")
     for i in range(4):
         session.messages.append({"role": "user", "content": f"u{i}"})
@@ -241,38 +280,19 @@ def test_history_multiple_tool_rounds(
     session.messages.append(_assistant(("r2a", "r2b")))
     session.messages.append(_result("r2a"))
     session.messages.append(_result("r2b"))
-    for i in range(3):
-        session.messages.append({"role": "user", "content": f"tail{i}"})
+    session.messages.append({"role": "assistant", "content": "done"})
 
     history = session.get_history(max_messages=limit)
 
-    assert [m["role"] for m in history] == roles
-    leading = history[0]
-    if leading["role"] == "assistant":
-        assert leading["tool_calls"][0]["id"] == first_call
-    else:
-        assert leading["tool_call_id"] == first_call
-
-
-@pytest.mark.parametrize("limit", [8, 6])
-def test_history_round_window_pairing(isolated_home, limit: int) -> None:
-    """Windows anchored on an assistant call keep results answered."""
-    session = Session(session_id=f"rounds-paired-{limit}")
-    for i in range(4):
-        session.messages.append({"role": "user", "content": f"u{i}"})
-    session.messages.append(_assistant(("r0",)))
-    session.messages.append(_result("r0"))
-    session.messages.append(_assistant(("r1",)))
-    session.messages.append(_result("r1"))
-    session.messages.append(_assistant(("r2a", "r2b")))
-    session.messages.append(_result("r2a"))
-    session.messages.append(_result("r2b"))
-    for i in range(3):
-        session.messages.append({"role": "user", "content": f"tail{i}"})
-
-    history = session.get_history(max_messages=limit)
-
-    assert history[0]["role"] == "assistant"
+    assert [message["role"] for message in history] == expected_roles
+    declared_ids = [
+        call["id"] for message in history for call in message.get("tool_calls", [])
+    ]
+    result_ids = [
+        message["tool_call_id"] for message in history if message["role"] == "tool"
+    ]
+    assert declared_ids == expected_tool_ids
+    assert result_ids == expected_tool_ids
     _assert_window_paired(history)
 
 
@@ -281,14 +301,14 @@ def test_history_round_window_pairing(isolated_home, limit: int) -> None:
     [
         (6, ["u0", "", "out-c1", "out-c2", "done", "u5"]),
         (10, ["u0", "", "out-c1", "out-c2", "done", "u5"]),
-        (5, ["", "out-c1", "out-c2", "done", "u5"]),
+        (5, ["u5"]),
     ],
-    ids=["at-limit", "under-limit", "over-limit"],
+    ids=["at-limit", "under-limit", "starts-after-user"],
 )
 def test_history_at_under_and_over_limit(
-    isolated_home, limit: int, expected_contents: list[str]
+    isolated_home: Path, limit: int, expected_contents: list[str]
 ) -> None:
-    """Equal, smaller, and larger histories all clip safely."""
+    """The requested limit clips history, then aligns it to a user turn."""
     session = Session(session_id="limits")
     session.messages.append({"role": "user", "content": "u0"})
     session.messages.append(_assistant(("c1", "c2")))
@@ -299,12 +319,14 @@ def test_history_at_under_and_over_limit(
 
     history = session.get_history(max_messages=limit)
 
-    assert [m["content"] for m in history] == expected_contents
+    assert [message["content"] for message in history] == expected_contents
     _assert_window_paired(history)
 
 
-def test_history_plain_truncation_window(isolated_home) -> None:
-    """The default window is exactly last-50, even splitting a round."""
+def test_history_default_window_aligns_tool_call_boundary(
+    isolated_home: Path,
+) -> None:
+    """The default 500-message window drops its leading orphan tool result."""
     session = Session(session_id="scale")
     for i in range(299):
         session.messages.append(_assistant((f"c{i}",)))
@@ -313,21 +335,53 @@ def test_history_plain_truncation_window(isolated_home) -> None:
 
     history = session.get_history()
 
-    assert len(history) == 50
-    assert history[0]["role"] == "tool"
-    assert history[0]["tool_call_id"] == "c274"
-    assert history[-1]["role"] == "assistant"
-    assert history[-1]["content"] == "tail"
-    tool_ids = [m["tool_call_id"] for m in history if m["role"] == "tool"]
-    assert len(tool_ids) == 25
-    assert tool_ids[0] == "c274"
-    assert tool_ids[-1] == "c298"
-    # c274's result enters the window without its declaring call: plain
-    # last-N clipping can split a round (see defect report).
-    declared = {
-        tc["id"]
-        for m in history
-        if m["role"] == "assistant"
-        for tc in m.get("tool_calls", [])
-    }
-    assert "c274" not in declared
+    assert len(history) == 499
+    assert history[0]["role"] == "assistant"
+    assert history[0]["tool_calls"][0]["id"] == "c50"
+    assert history[-1] == {"role": "assistant", "content": "tail"}
+    result_ids = [
+        message["tool_call_id"] for message in history if message["role"] == "tool"
+    ]
+    assert result_ids == [f"c{i}" for i in range(50, 299)]
+    _assert_window_paired(history)
+
+
+def test_history_uses_unconsolidated_messages_without_mutation(
+    isolated_home: Path,
+) -> None:
+    """History starts at the consolidation offset without changing stored data."""
+    session = Session(session_id="consolidated")
+    session.messages = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "current question"},
+        _assistant(("current-call",)),
+        _result("current-call"),
+        {"role": "assistant", "content": "current answer"},
+    ]
+    session.last_consolidated = 2
+    original_messages = deepcopy(session.messages)
+
+    history = session.get_history()
+
+    assert [message["content"] for message in history] == [
+        "current question",
+        "",
+        "out-current-call",
+        "current answer",
+    ]
+    _assert_window_paired(history)
+    assert session.messages == original_messages
+    assert session.last_consolidated == 2
+
+
+def test_clear_resets_messages_and_consolidation_offset(isolated_home: Path) -> None:
+    """Clearing a session resets both its messages and history offset."""
+    session = Session(session_id="clear")
+    session.messages = [{"role": "user", "content": "old"}]
+    session.last_consolidated = 1
+
+    session.clear()
+
+    assert session.messages == []
+    assert session.last_consolidated == 0

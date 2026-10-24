@@ -247,7 +247,7 @@ async def test_max_iterations_fallback(isolated_home: Path, tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_persistence_and_reload(isolated_home: Path, tmp_path: Path) -> None:
     """Full turn history reloads with tool metadata and no system."""
-    runner, provider = _runner(
+    runner, _ = _runner(
         [
             LLMResponse(
                 content="",

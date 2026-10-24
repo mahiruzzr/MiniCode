@@ -24,6 +24,7 @@ class ProviderSpec:
     default_api_base: str = ""
     strip_model_prefix: bool = False
     model_overrides: tuple[tuple[str, dict[str, Any]], ...] = ()
+    supports_prompt_caching: bool = False
 
     @property
     def label(self) -> str:
@@ -47,6 +48,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="",
         strip_model_prefix=False,
         model_overrides=(),
+        supports_prompt_caching=False,
     ),
     ProviderSpec(
         name="anthropic",
@@ -63,6 +65,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="",
         strip_model_prefix=False,
         model_overrides=(),
+        supports_prompt_caching=True,
     ),
 )
 

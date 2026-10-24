@@ -2,6 +2,8 @@
 
 import json
 import os
+import secrets
+import string
 from typing import Any
 
 import litellm
@@ -14,6 +16,12 @@ from .registry import find_by_model, find_gateway
 # Standard OpenAI chat-completion message keys; extras (e.g. reasoning_content) are stripped for strict providers.
 # thinking-enabled models (Kimi k2.5, DeepSeek-R1, etc.).
 _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"})
+_ALNUM = string.ascii_letters + string.digits
+
+
+def _short_tool_id() -> str:
+    """Generate a 9-char alphanumeric ID compatible with all providers (incl. Mistral)."""
+    return "".join(secrets.choice(_ALNUM) for _ in range(9))
 
 
 class LiteLLMProvider(LLMProvider):
@@ -110,6 +118,39 @@ class LiteLLMProvider(LLMProvider):
             return model
         return f"{canonical_prefix}/{remainder}"
 
+    def _supports_cache_control(self, model: str) -> bool:
+        """Return True when the provider supports cache_control on content blocks."""
+        if self._gateway is not None:
+            return self._gateway.supports_prompt_caching
+        spec = find_by_model(model)
+        return spec is not None and spec.supports_prompt_caching
+
+    def _apply_cache_control(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+        """Return copies of messages and tools with cache_control injected."""
+        new_messages = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                content = msg["content"]
+                if isinstance(content, str):
+                    new_content = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+                else:
+                    new_content = list(content)
+                    new_content[-1] = {**new_content[-1], "cache_control": {"type": "ephemeral"}}
+                new_messages.append({**msg, "content": new_content})
+            else:
+                new_messages.append(msg)
+
+        new_tools = tools
+        if tools:
+            new_tools = list(tools)
+            new_tools[-1] = {**new_tools[-1], "cache_control": {"type": "ephemeral"}}
+
+        return new_messages, new_tools
+
     def _apply_model_overrides(self, model: str, kwargs: dict[str, Any]) -> None:
         """Apply model-specific parameter overrides from the registry."""
         model_lower = model.lower()
@@ -157,19 +198,23 @@ class LiteLLMProvider(LLMProvider):
         Returns:
             Normalized LLMResponse for the agent layer.
         """
-        resolved = self._resolve_model(model or self.default_model)
+        original_model = model or self.default_model
+        model = self._resolve_model(original_model)
+
+        if self._supports_cache_control(original_model):
+            messages, tools = self._apply_cache_control(messages, tools)
 
         # Clamp max_tokens to at least 1 — negative or zero values cause
         # LiteLLM to reject the request with "max_tokens must be at least 1".
         max_tokens = max(1, max_tokens)
 
         kwargs: dict[str, Any] = {
-            "model": resolved,
+            "model": model,
             "messages": self._sanitize_messages(messages),
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-        self._apply_model_overrides(resolved, kwargs)
+        self._apply_model_overrides(model, kwargs)
         if self.api_key:
             kwargs["api_key"] = self.api_key
         if self.api_base:
@@ -213,7 +258,7 @@ class LiteLLMProvider(LLMProvider):
                         arguments = {"raw": arguments}
                 tool_calls.append(
                     ToolCallRequest(
-                        id=call.id,
+                        id=_short_tool_id(),
                         name=call.function.name,
                         arguments=arguments,
                     )
