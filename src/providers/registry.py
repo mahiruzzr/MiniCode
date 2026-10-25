@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic.alias_generators import to_snake
+
 
 @dataclass(frozen=True)
 class ProviderSpec:
@@ -79,8 +81,9 @@ def find_by_name(name: str) -> ProviderSpec | None:
     Returns:
         The matching provider specification, or None if not found.
     """
+    normalized = to_snake(name.replace("-", "_"))
     for spec in PROVIDERS:
-        if spec.name == name:
+        if spec.name == normalized:
             return spec
     return None
 

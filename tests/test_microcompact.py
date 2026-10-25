@@ -585,7 +585,10 @@ async def test_max_iterations_fallback_with_compaction(
 
     result = await runner.run("go", session_id="mc-max")
 
-    assert result == "I've completed processing but have no response to give."
+    assert result == (
+        "I reached the maximum number of tool call iterations (12) without completing "
+        "the task. You can try breaking the task into smaller steps."
+    )
     assert len(provider.seen) == 12
     tools = [m for m in provider.seen[-1] if m.get("role") == "tool"]
     assert len(tools) == 11

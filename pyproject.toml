@@ -7,7 +7,16 @@ name = "minicode"
 version = "0.1.0"
 description = "MiniCode - minimal agent scaffold."
 requires-python = ">=3.10"
-dependencies = ["litellm", "pydantic", "pydantic-settings", "pyyaml", "rich"]
+dependencies = [
+    "anthropic>=0.30",
+    "json-repair>=0.20",
+    "litellm",
+    "openai>=1.30.0",
+    "pydantic",
+    "pydantic-settings",
+    "pyyaml",
+    "rich",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

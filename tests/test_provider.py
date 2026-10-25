@@ -1,5 +1,6 @@
 """Tests for provider types, registry lookup, and the LiteLLM adapter."""
 
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,6 +16,58 @@ from providers.registry import (
     find_by_name,
     find_gateway,
 )
+
+
+def _stream_chunk(
+    content: str | None = None,
+    tool_calls: list[Any] | None = None,
+    finish: str | None = None,
+    usage: Any = None,
+    reasoning: str | None = None,
+) -> SimpleNamespace:
+    """Create a LiteLLM-style streaming chunk for tests."""
+    delta = SimpleNamespace(content=content, tool_calls=tool_calls)
+    if reasoning is not None:
+        delta.reasoning_content = reasoning
+    return SimpleNamespace(
+        choices=[SimpleNamespace(delta=delta, finish_reason=finish)],
+        usage=usage,
+    )
+
+
+def _stream_tool_call(
+    index: int,
+    call_id: str | None = None,
+    name: str | None = None,
+    arguments: str | None = None,
+) -> SimpleNamespace:
+    """Create a partial tool call in a LiteLLM-style chunk."""
+    return SimpleNamespace(
+        index=index,
+        id=call_id,
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def _mock_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    chunks: list[Any],
+) -> tuple[dict[str, Any], list[Any]]:
+    """Mock acompletion with an async stream and record consumed chunks."""
+    seen: dict[str, Any] = {}
+    consumed: list[Any] = []
+
+    async def stream() -> AsyncIterator[Any]:
+        for chunk in chunks:
+            consumed.append(chunk)
+            yield chunk
+
+    async def fake_call(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return stream()
+
+    monkeypatch.setattr(litellm_module, "acompletion", fake_call)
+    return seen, consumed
 
 
 def test_tool_call_request_fields() -> None:
@@ -36,6 +89,78 @@ def test_provider_is_abstract() -> None:
     """LLMProvider cannot run without chat and default model."""
     with pytest.raises(TypeError):
         LLMProvider()  # type: ignore[abstract]
+
+
+def test_sanitize_replaces_empty_string_by_role_and_tool_calls() -> None:
+    """Empty string content becomes None for tool-call turns, "(empty)" otherwise."""
+    cleaned = LLMProvider._sanitize_empty_content([
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+        {"role": "user", "content": ""},
+    ])
+    assert cleaned[0]["content"] is None
+    assert cleaned[1]["content"] == "(empty)"
+
+
+def test_sanitize_drops_empty_text_blocks_in_list_content() -> None:
+    """Empty text-ish blocks are removed while real content survives."""
+    cleaned = LLMProvider._sanitize_empty_content([
+        {"role": "user", "content": [
+            {"type": "text", "text": ""},
+            {"type": "input_text", "text": None},
+            {"type": "output_text", "text": ""},
+            {"type": "text", "text": "keep me"},
+        ]},
+    ])
+    assert cleaned[0]["content"] == [{"type": "text", "text": "keep me"}]
+
+
+def test_sanitize_strips_meta_fields_but_keeps_content() -> None:
+    """Internal _meta fields are removed; sibling fields stay untouched."""
+    cleaned = LLMProvider._sanitize_empty_content([
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://x/y.png"}, "_meta": {"src": "paste"}},
+            {"type": "text", "text": "caption"},
+        ]},
+    ])
+    assert cleaned[0]["content"][0] == {
+        "type": "image_url", "image_url": {"url": "https://x/y.png"},
+    }
+    assert cleaned[0]["content"][1] == {"type": "text", "text": "caption"}
+
+
+def test_sanitize_empty_list_falls_back_by_role() -> None:
+    """Lists emptied by cleanup follow the same None/"(empty)" rule as strings."""
+    cleaned = LLMProvider._sanitize_empty_content([
+        {"role": "assistant", "content": [{"type": "text", "text": ""}], "tool_calls": [{"id": "c1"}]},
+        {"role": "user", "content": [{"type": "text", "text": ""}]},
+    ])
+    assert cleaned[0]["content"] is None
+    assert cleaned[1]["content"] == "(empty)"
+
+
+def test_sanitize_wraps_dict_content_in_list() -> None:
+    """A bare dict content is normalized to a one-element list."""
+    blob = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+    cleaned = LLMProvider._sanitize_empty_content([{"role": "user", "content": blob}])
+    assert cleaned[0]["content"] == [blob]
+
+
+def test_sanitize_passes_unmodified_messages_through() -> None:
+    """Messages that need no edits keep their content and identity."""
+    messages = [
+        {"role": "system", "content": "You are MiniCode."},
+        {"role": "user", "content": "hello"},
+        {"role": "user", "content": None},
+        {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+    ]
+    cleaned = LLMProvider._sanitize_empty_content(messages)
+    assert cleaned == messages
+    assert all(cleaned[i] is messages[i] for i in range(len(messages)))
+
+    # Modified messages are shallow copies; the originals stay untouched.
+    original = {"role": "user", "content": ""}
+    LLMProvider._sanitize_empty_content([original])
+    assert original["content"] == ""
 
 
 def test_registry_holds_openai_and_anthropic() -> None:
@@ -392,3 +517,192 @@ async def test_chat_tool_choice_ignored_without_tools(
     """tool_choice is not sent when no tools are defined."""
     seen = await _capture_chat(monkeypatch, tool_choice="required")
     assert "tool_choice" not in seen
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_emits_text_deltas_and_returns_complete_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Text chunks stream in order and metadata is retained."""
+    chunks = [
+        _stream_chunk(content="Hel", reasoning="think"),
+        _stream_chunk(content="lo", reasoning="ing"),
+        _stream_chunk(
+            content="!",
+            finish="stop",
+            usage=SimpleNamespace(
+                prompt_tokens=2,
+                completion_tokens=3,
+                total_tokens=5,
+            ),
+        ),
+    ]
+    seen, consumed = _mock_stream(monkeypatch, chunks)
+    deltas: list[str] = []
+
+    async def on_delta(delta: str) -> None:
+        deltas.append(delta)
+
+    result = await LiteLLMProvider().chat_stream(
+        [{"role": "user", "content": "hi"}],
+        on_content_delta=on_delta,
+    )
+
+    assert seen["stream"] is True
+    assert deltas == ["Hel", "lo", "!"]
+    assert result.content == "Hello!"
+    assert result.finish_reason == "stop"
+    assert result.usage == {
+        "prompt_tokens": 2,
+        "completion_tokens": 3,
+        "total_tokens": 5,
+    }
+    assert result.reasoning_content == "thinking"
+    assert consumed == chunks
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_consumes_all_chunks_without_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing callback does not stop stream consumption."""
+    chunks = [_stream_chunk(content="one"), _stream_chunk(content=" two")]
+    seen, consumed = _mock_stream(monkeypatch, chunks)
+
+    result = await LiteLLMProvider().chat_stream([{"role": "user", "content": "hi"}])
+
+    assert seen["stream"] is True
+    assert consumed == chunks
+    assert result.content == "one two"
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_merges_tool_call_fragments_in_index_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fragmented tool fields and arguments combine by call index."""
+    chunks = [
+        _stream_chunk(
+            tool_calls=[
+                _stream_tool_call(
+                    1, call_id="call-b", name="bash", arguments='{"command":"'
+                ),
+                _stream_tool_call(
+                    0, call_id="call-a", name="read_", arguments='{"path":'
+                ),
+            ]
+        ),
+        _stream_chunk(
+            tool_calls=[
+                _stream_tool_call(0, name="file", arguments='"a.py"}'),
+                _stream_tool_call(1, name="_tool", arguments='echo hi"}'),
+            ],
+            finish="tool_calls",
+        ),
+    ]
+    _mock_stream(monkeypatch, chunks)
+
+    result = await LiteLLMProvider().chat_stream(
+        [{"role": "user", "content": "read and run"}]
+    )
+
+    assert result.content is None
+    assert result.finish_reason == "tool_calls"
+    assert [(call.id, call.name, call.arguments) for call in result.tool_calls] == [
+        ("call-a", "read_file", {"path": "a.py"}),
+        ("call-b", "bash_tool", {"command": "echo hi"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_error_returns_error_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Iteration failures become the provider error response."""
+
+    async def stream() -> AsyncIterator[Any]:
+        yield _stream_chunk(content="partial")
+        raise RuntimeError("stream broke")
+
+    async def fake_call(**kwargs: Any) -> Any:
+        return stream()
+
+    monkeypatch.setattr(litellm_module, "acompletion", fake_call)
+    result = await LiteLLMProvider().chat_stream([{"role": "user", "content": "hi"}])
+
+    assert result.finish_reason == "error"
+    assert result.content == "Error calling LLM: stream broke"
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_callback_error_is_not_reported_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Callback failures surface as an error response."""
+    _mock_stream(monkeypatch, [_stream_chunk(content="hello")])
+
+    async def on_delta(delta: str) -> None:
+        raise RuntimeError("callback failed")
+
+    result = await LiteLLMProvider().chat_stream(
+        [{"role": "user", "content": "hi"}],
+        on_content_delta=on_delta,
+    )
+
+    assert result.finish_reason == "error"
+    assert result.content == "Error calling LLM: callback failed"
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_request_matches_chat_with_stream_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stream requests retain the non-streaming request options."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(litellm_module.litellm, "api_base", None)
+    provider = LiteLLMProvider(
+        api_key="sk-test",
+        api_base="https://api.example.test",
+        extra_headers={"X-Test": "yes"},
+    )
+    calls: list[dict[str, Any]] = []
+    chunks = [_stream_chunk(content="ok", finish="stop")]
+
+    async def stream() -> AsyncIterator[Any]:
+        for chunk in chunks:
+            yield chunk
+
+    async def fake_call(**kwargs: Any) -> Any:
+        calls.append(dict(kwargs))
+        if kwargs.get("stream"):
+            return stream()
+        return _response(content="ok")
+
+    monkeypatch.setattr(litellm_module, "acompletion", fake_call)
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "hi"},
+    ]
+    tools = [{"type": "function", "function": {"name": "bash"}}]
+    request = {
+        "messages": messages,
+        "tools": tools,
+        "model": "claude-sonnet-4",
+        "max_tokens": 0,
+        "temperature": 0.3,
+        "reasoning_effort": "high",
+        "tool_choice": "required",
+    }
+
+    await provider.chat_stream(**request)
+    await provider.chat(**request)
+
+    stream_kwargs = calls[0]
+    assert stream_kwargs.pop("stream") is True
+    assert stream_kwargs == calls[1]
+    assert stream_kwargs["max_tokens"] == 1
+    assert stream_kwargs["api_key"] == "sk-test"
+    assert stream_kwargs["api_base"] == "https://api.example.test"
+    assert stream_kwargs["extra_headers"] == {"X-Test": "yes"}
+    assert stream_kwargs["reasoning_effort"] == "high"
+    assert stream_kwargs["tool_choice"] == "required"

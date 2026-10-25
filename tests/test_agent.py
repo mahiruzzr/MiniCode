@@ -174,11 +174,20 @@ async def test_update_plan_tool_is_registered_and_executes(
 
 
 @pytest.mark.asyncio
-async def test_plain_final_response(isolated_home: Path, tmp_path: Path) -> None:
-    """No tool calls means one round and a direct answer."""
+async def test_plain_final_response(
+    isolated_home: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A direct model response does not emit the iteration-limit warning."""
     runner, provider = _runner([LLMResponse(content="hi")], tmp_path)
+
     assert await runner.run("hello") == "hi"
     assert len(provider.seen) == 1
+    assert not any(
+        record.name == "agent.loop" and "Max iterations" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -229,8 +238,12 @@ async def test_multi_calls_share_one_iteration(
 
 
 @pytest.mark.asyncio
-async def test_max_iterations_fallback(isolated_home: Path, tmp_path: Path) -> None:
-    """Exhausted budgets end after max_iterations rounds with a fallback."""
+async def test_max_iterations_warns_and_saves_fallback(
+    isolated_home: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Exhaustion warns, returns guidance, and saves the final response."""
     script = [
         LLMResponse(
             content="",
@@ -239,9 +252,25 @@ async def test_max_iterations_fallback(isolated_home: Path, tmp_path: Path) -> N
         for i in range(10)
     ]
     runner, provider = _runner(script, tmp_path, max_iterations=2)
-    result = await runner.run("go")
-    assert result == "I've completed processing but have no response to give."
+    result = await runner.run("go", session_id="max-iterations")
+
+    assert result == (
+        "I reached the maximum number of tool call iterations (2) without completing "
+        "the task. You can try breaking the task into smaller steps."
+    )
     assert len(provider.seen) == 2
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "agent.loop" and record.levelname == "WARNING"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].getMessage() == "Max iterations (2) reached"
+    assert warnings[0].args == (2,)
+
+    session = runner.sessions.get_session("max-iterations")
+    assert session.messages[-1]["role"] == "assistant"
+    assert session.messages[-1]["content"] == result
 
 
 @pytest.mark.asyncio
@@ -555,7 +584,10 @@ async def test_microcompact_keeps_flow_on_iteration_budget_fallback(
 
     result = await runner.run("go", session_id="mc-budget")
 
-    assert result == "I've completed processing but have no response to give."
+    assert result == (
+        "I reached the maximum number of tool call iterations (2) without completing "
+        "the task. You can try breaking the task into smaller steps."
+    )
     sent = [m for m in provider.seen[1] if m.get("role") == "tool"]
     assert [m["content"] for m in sent[:2]] == [
         "[bash result omitted from context]",

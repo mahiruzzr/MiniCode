@@ -220,6 +220,12 @@ class AgentLoop:
             else:
                 final_content = response.content
                 break
+        else:
+            logger.warning("Max iterations (%s) reached", self.max_iterations)
+            final_content = (
+                f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
+                "without completing the task. You can try breaking the task into smaller steps."
+            )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
