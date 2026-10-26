@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+import json
 from typing import Any
 
 
@@ -13,6 +14,27 @@ class ToolCallRequest:
     id: str
     name: str
     arguments: dict[str, Any]
+    extra_content: dict[str, Any] | None = None
+    provider_specific_fields: dict[str, Any] | None = None
+    function_provider_specific_fields: dict[str, Any] | None = None
+
+    def to_openai_tool_call(self) -> dict[str, Any]:
+        """Serialize to an OpenAI-style tool_call payload."""
+        tool_call = {
+            "id": self.id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": json.dumps(self.arguments, ensure_ascii=False),
+            },
+        }
+        if self.extra_content:
+            tool_call["extra_content"] = self.extra_content
+        if self.provider_specific_fields:
+            tool_call["provider_specific_fields"] = self.provider_specific_fields
+        if self.function_provider_specific_fields:
+            tool_call["function"]["provider_specific_fields"] = self.function_provider_specific_fields
+        return tool_call
 
 
 @dataclass
@@ -47,29 +69,11 @@ class LLMProvider(ABC):
     def _sanitize_empty_content(
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Normalize message content into provider-safe shapes.
+        """Normalize message content for provider requests.
 
-        Providers reject empty or unusually shaped content, and internal
-        metadata must not leak into API requests:
-
-        * Empty string content becomes ``None`` on assistant messages that
-          also carry tool calls (the calls are the real content), and the
-          ``"(empty)"`` placeholder everywhere else.
-        * Inside list content, empty ``text``/``input_text``/``output_text``
-          blocks are dropped and internal ``_meta`` fields are stripped;
-          the ``None``/``"(empty)"`` rule applies again when nothing
-          survives the cleanup.
-        * A bare dict is wrapped in a one-element list.
-
-        Messages are shallow-copied only when something changes; messages
-        that need no edits are passed through by reference.
-
-        Args:
-            messages: OpenAI-format chat messages.
-
-        Returns:
-            A new message list with normalized content. The input list and
-            any unmodified messages are left untouched.
+        Replaces empty content with provider-safe values, removes empty text
+        blocks and internal metadata, and wraps dictionary content in a list.
+        Messages are copied only when changes are needed.
         """
         result: list[dict[str, Any]] = []
         for msg in messages:
@@ -124,6 +128,28 @@ class LLMProvider(ABC):
             result.append(msg)
 
         return result
+
+    @staticmethod
+    def _sanitize_request_messages(
+        messages: list[dict[str, Any]],
+        allowed_keys: frozenset[str],
+    ) -> list[dict[str, Any]]:
+        """Filter messages to allowed keys and normalize assistant content.
+
+        Args:
+            messages: Request messages to sanitize.
+            allowed_keys: Message keys permitted in provider requests.
+
+        Returns:
+            A new list of filtered and normalized message dictionaries.
+        """
+        sanitized = []
+        for msg in messages:
+            clean = {k: v for k, v in msg.items() if k in allowed_keys}
+            if clean.get("role") == "assistant" and "content" not in clean:
+                clean["content"] = None
+            sanitized.append(clean)
+        return sanitized
 
     @abstractmethod
     async def chat(
